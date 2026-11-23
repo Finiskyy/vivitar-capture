@@ -10,7 +10,7 @@ A native Windows app for USB capture cards (built for a Vivitar card), styled af
 
 ## Download
 
-Grab `VivitarCapture.exe` from the [latest release](../../releases/tag/latest). It's a single file with no installer.
+Grab **VivitarCapture.zip** from the [latest release](../../releases/tag/latest), extract it and run `VivitarCapture.exe`. The two `amd_fidelityfx_*.dll` files next to it enable AMD FSR 3 / FSR 4; the exe also runs on its own without them.
 
 ## Shortcuts
 
