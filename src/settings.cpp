@@ -35,6 +35,7 @@ void Settings::Load() {
   outRes = GetI(L"outRes", 0);
   bitrate = GetI(L"bitrate", 20);
   frameGen = GetI(L"frameGen", 0) != 0;
+  dedupe = GetI(L"dedupe", 1) != 0;
   upscaler = GetI(L"upscaler", 0);
   saveDir = GetS(L"saveDir", DefaultSaveDir());
   if (bri < -50 || bri > 50) bri = 0;
@@ -70,6 +71,7 @@ void Settings::Save() const {
   i(L"outRes", outRes);
   i(L"bitrate", bitrate);
   i(L"frameGen", frameGen);
+  i(L"dedupe", dedupe);
   i(L"upscaler", upscaler);
   str(L"saveDir", saveDir);
   std::wstring path = IniPath(), tmp = path + L".tmp";

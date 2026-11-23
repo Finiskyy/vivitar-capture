@@ -268,6 +268,41 @@ bool VideoCapture::Open(const CaptureRequest& req, std::string& err) {
   return true;
 }
 
+// A console running at 30 fps over a 60 Hz HDMI link sends every frame twice. The card compresses each copy
+// separately, so the copies aren't bit-identical: compare averaged luma blocks with a noise tolerance instead.
+bool VideoCapture::IsDuplicate(const VideoFrame& f) {
+  const int GX = 64, GY = 36, B = 4;  // 64x36 sample blocks of 4x4 pixels
+  if (f.w < GX * B || f.h < GY * B) return false;
+  sig_.resize(GX * GY);
+  const uint8_t* y = f.data.data();
+  for (int gy = 0; gy < GY; gy++) {
+    int py = int((gy + 0.5) * f.h / GY) - B / 2;
+    for (int gx = 0; gx < GX; gx++) {
+      int px = int((gx + 0.5) * f.w / GX) - B / 2;
+      int sum = 0;
+      for (int dy = 0; dy < B; dy++) {
+        const uint8_t* row = y + size_t(py + dy) * f.w + px;
+        for (int dx = 0; dx < B; dx++) sum += row[dx];
+      }
+      sig_[gy * GX + gx] = sum;  // 0..16*255
+    }
+  }
+  bool dup = false;
+  if (prevSig_.size() == sig_.size()) {
+    long long total = 0;
+    int maxd = 0;
+    for (size_t i = 0; i < sig_.size(); i++) {
+      int d = std::abs(sig_[i] - prevSig_[i]);
+      total += d;
+      maxd = std::max(maxd, d);
+    }
+    double meanPerPixel = double(total) / sig_.size() / (B * B);
+    dup = meanPerPixel < 0.9 && maxd < 8 * B * B;  // < ~1 level average, no block moved by more than 8 levels
+  }
+  prevSig_.swap(sig_);
+  return dup;
+}
+
 void VideoCapture::OnSample(HRESULT hr, DWORD flags, IMFSample* s) {
   if (stop_) return;
   if (FAILED(hr) || (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM))) {
@@ -324,6 +359,7 @@ void VideoCapture::OnSample(HRESULT hr, DWORD flags, IMFSample* s) {
         if (locked2d) b2->Unlock2D();
         else b->Unlock();
         if (ok) {
+          f.dup = IsDuplicate(f);
           {
             std::lock_guard<std::mutex> lk(cbMutex_);
             if (onFrame_) onFrame_(f);

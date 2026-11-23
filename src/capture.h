@@ -24,6 +24,7 @@ struct VideoFrame {
   std::vector<uint8_t> data;
   UINT32 w = 0, h = 0;
   int64_t t = 0;  // Now100ns() at arrival
+  bool dup = false;  // looks the same as the previous frame (e.g. a 30 fps game captured at 60 fps)
 };
 
 struct CaptureRequest {
@@ -61,11 +62,13 @@ class VideoCapture {
 
  private:
   void OnSample(HRESULT hr, DWORD flags, IMFSample* s);
+  bool IsDuplicate(const VideoFrame& f);
 
   std::atomic<bool> open_{false}, stop_{false}, lost_{false};
   ComPtr<IMFMediaSource> src_;
   ComPtr<IMFSourceReader> reader_;
   ReaderCallback* cb_ = nullptr;
+  std::vector<int> sig_, prevSig_;
   std::mutex qm_;
   std::deque<VideoFrame> q_;
   std::vector<VideoFrame> pool_;

@@ -256,7 +256,15 @@ class App {
   bool reopenQueued = false;
   void FinishOpen(OpenResult r);
   AudioMonitor mon;
-  Recorder rec;
+  // The active recorder. Audio arrives on another thread, so access goes through recM.
+  std::mutex recM;
+  std::shared_ptr<Recorder> rec;
+  std::shared_ptr<Recorder> Rec() {
+    std::lock_guard<std::mutex> lk(recM);
+    return rec;
+  }
+  std::vector<std::thread> finalizers;  // recordings being finalised in the background
+  std::string lastEncoder;
   Renderer R;
   std::vector<DeviceInfo> vids, auds;
   std::wstring curVideoName;
@@ -276,8 +284,9 @@ class App {
   std::deque<FgFrame> fgQueue;
   std::vector<RenderTarget> fgPool;
   RenderTarget fgIn[4], upRT[2];
-  int fgInIdx = 0, displayHz = 60, fgOutCount = 0;
-  double fgFps = 0;
+  int fgInIdx = 0, displayHz = 60, fgOutCount = 0, uniqueCount = 0;
+  double fgFps = 0, contentFps = 0;
+  int64_t lastUniqueT = 0, fgPeriod = 0;
   bool FgActive() const { return S.frameGen && fx.Ready() && !fgFailed && cap->IsOpen(); }
   void ProcessFG(int64_t t, bool rec);
   void RecordFrame(const SrcOverride* ov, int64_t t);
@@ -302,7 +311,7 @@ class App {
 
   int tab = 0;
   std::vector<LibItem> lib;
-  bool libDirty = true;
+  std::atomic<bool> libDirty{true};
   int pendingDelete = -1;
 
   bool fullscreen = false;
@@ -328,6 +337,8 @@ void App::Init() {
 
 void App::Shutdown() {
   if (recording) StopRecording();
+  for (auto& t : finalizers)
+    if (t.joinable()) t.join();
   if (opening.valid()) FinishOpen(opening.get());
   cap->Close();
   acap->Close();
@@ -406,7 +417,7 @@ void App::OpenDevice() {
     r.acap = std::make_unique<AudioCapture>();
     r.acap->onAudio = [this](const float* d, size_t n, int64_t t) {
       mon.Push(d, n);
-      rec.PushAudio(d, n, t);
+      if (auto r = Rec()) r->PushAudio(d, n, t);
     };
     std::string err;
     if (req.id.empty()) r.capErr = "nodevice";
@@ -529,13 +540,20 @@ void App::Tick() {
     fgQueue.clear();
     fx.FrcReset();
     fgWas = fg;
+    lastUniqueT = 0;
+    fgPeriod = 0;
   }
   bool converted = false;
   if (!frames.empty()) {
     frameCount += (int)frames.size();
     bool gpuRec = recording && recGpu;
+    for (auto& f : frames)
+      if (!f.dup) uniqueCount++;
     if (fg || gpuRec) {
       for (auto& f : frames) {
+        // Repeated frames carry no new motion: feeding them to frame generation would make it
+        // interpolate between two identical pictures, so skip them and pace by the game's real frame rate.
+        if (fg && S.dedupe && f.dup) continue;
         R.Upload(f);
         R.Convert(color, enh.denoise);
         if (fg) ProcessFG(f.t, gpuRec);
@@ -552,12 +570,14 @@ void App::Tick() {
   if (now - fpsT >= 1.0) {
     measuredFps = frameCount / (now - fpsT);
     fgFps = fgOutCount / (now - fpsT);
+    contentFps = uniqueCount / (now - fpsT);
+    uniqueCount = 0;
     fgOutCount = 0;
     frameCount = 0;
     fpsT = now;
   }
   if (recording && now - recBytesT > 0.5) {
-    recBytes = rec.Bytes();
+    if (rec) recBytes = rec->Bytes();
     recBytesT = now;
   }
 
@@ -640,7 +660,14 @@ void App::ProcessFG(int64_t t, bool rec) {
     ToastMsg("AMD frame generation stopped working, so it was turned off.", cRec, 8);
     return;
   }
-  int64_t period = cap->cur.fpsN ? int64_t(10000000.0 * cap->cur.fpsD / cap->cur.fpsN) : 166667;
+  // Time between the real frames being interpolated (smoothed). With duplicate removal this follows the game's
+  // frame rate (e.g. 33 ms at 30 fps) instead of the capture rate.
+  int64_t nominal = cap->cur.fpsN ? int64_t(10000000.0 * cap->cur.fpsD / cap->cur.fpsN) : 166667;
+  int64_t gap = lastUniqueT ? t - lastUniqueT : nominal;
+  lastUniqueT = t;
+  gap = std::clamp<int64_t>(gap, nominal / 2, 1000000);
+  fgPeriod = fgPeriod ? (fgPeriod * 3 + gap) / 4 : gap;
+  int64_t period = fgPeriod;
   for (int i = 0; i < n; i++) {
     FgFrame f;
     if (!fgPool.empty()) {
@@ -669,7 +696,7 @@ void App::RecordFrame(const SrcOverride* ov, int64_t t) {
   R.Ensure(recRT, rw, rh, DXGI_FORMAT_R8G8B8A8_UNORM);
   DrawUp(recRT, FitContain, recEnh ? Enh() : EnhanceParams{}, Color(), -1.f, 1.f, ov, 1, recEnh);
   R.SubmitNV12(recRT, t);
-  R.CollectNV12([this](const uint8_t* d, size_t n, int64_t ts) { rec.PushVideo(d, n, ts); }, false);
+  R.CollectNV12([this](const uint8_t* d, size_t n, int64_t ts) { if (rec) rec->PushVideo(d, n, ts); }, false);
 }
 
 void App::DetectRefresh() {
@@ -699,35 +726,65 @@ void App::StartRecording() {
     cfg.w = cap->outW;
     cfg.h = cap->outH;
   }
-  cfg.fpsN = (cap->cur.fpsN ? cap->cur.fpsN : 60) * (fg ? 2 : 1);
+  cfg.fpsN = cap->cur.fpsN ? cap->cur.fpsN : 60;
   cfg.fpsD = cap->cur.fpsD ? cap->cur.fpsD : 1;
+  if (fg) {
+    // With duplicates skipped, a 30 fps game becomes 60 fps output, not 120.
+    double capFps = cap->cur.fps() > 1 ? cap->cur.fps() : 60;
+    if (S.dedupe && contentFps > 5 && contentFps < capFps * 0.75) {
+      cfg.fpsN = (UINT32)std::lround(contentFps) * 2;
+      cfg.fpsD = 1;
+    } else {
+      cfg.fpsN *= 2;
+    }
+  }
   cfg.mbps = S.bitrate;
   cfg.audio = acap->IsOpen();
   cfg.path = S.saveDir + L"\\Vivitar Capture " + TimestampName() + L".mp4";
   recStart = Now100ns();
   std::string err;
-  if (!rec.Start(cfg, recStart, err)) {
+  auto r = std::make_shared<Recorder>();
+  if (!r->Start(cfg, recStart, err)) {
     ToastMsg(err, cRec, 8);
     return;
+  }
+  lastEncoder = r->encoderName;
+  {
+    std::lock_guard<std::mutex> lk(recM);
+    rec = r;
   }
   recording = true;
   recBytes = 0;
   if (recGpu) R.ResetNV12();
-  else cap->SetOnFrame([this](const VideoFrame& f) { rec.PushVideo(f.data.data(), f.data.size(), f.t); });
+  else cap->SetOnFrame([r](const VideoFrame& f) { r->PushVideo(f.data.data(), f.data.size(), f.t); });
   ToastMsg("Recording started");
 }
 
 void App::StopRecording() {
   if (!recording) return;
   cap->SetOnFrame(nullptr);
-  if (recGpu) R.CollectNV12([this](const uint8_t* d, size_t n, int64_t t) { rec.PushVideo(d, n, t); }, true);
+  if (recGpu && rec) R.CollectNV12([this](const uint8_t* d, size_t n, int64_t t) { rec->PushVideo(d, n, t); }, true);
   recording = false;
-  std::wstring path = rec.cfg.path;
-  uint32_t dropped = rec.dropped.load();
-  rec.Stop();
-  std::wstring name = path.substr(path.find_last_of(L'\\') + 1);
-  ToastMsg("Saved \"" + W2U(name) + "\"" + (dropped ? "  (" + std::to_string(dropped) + " frames dropped)" : ""), cOk, 5);
-  libDirty = true;
+  std::shared_ptr<Recorder> r;
+  {
+    std::lock_guard<std::mutex> lk(recM);
+    r = std::move(rec);
+  }
+  if (!r) return;
+  ToastMsg("Saving recording...");
+  // Finalising the MP4 waits for the encoder to drain, so never do it on the UI thread.
+  finalizers.emplace_back([this, r] {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    int64_t t0 = Now100ns();
+    std::wstring path = r->cfg.path;
+    r->Stop();
+    Log("Recording stop took %.0f ms", (Now100ns() - t0) / 10000.0);
+    uint32_t dropped = r->dropped.load();
+    std::wstring name = path.substr(path.find_last_of(L'\\') + 1);
+    ToastMsg("Saved \"" + W2U(name) + "\"" + (dropped ? "  (" + std::to_string(dropped) + " frames dropped)" : ""), cOk, 5);
+    libDirty = true;
+    CoUninitialize();
+  });
 }
 
 void App::Screenshot() {
@@ -1346,16 +1403,22 @@ void App::Sidebar() {
     DetectRefresh();
     Dirty();
   }
+  if (Toggle("##dedupe", "Skip duplicate frames", &S.dedupe)) {
+    fgPeriod = 0;
+    Dirty();
+  }
   ImGui::EndDisabled();
   if (!fx.Ready()) Muted(fx.status.c_str());
   else if (S.frameGen && fgFailed) Muted("Frame generation couldn't start. The log file has the details.");
   else if (FgActive()) {
     char fb[96];
-    snprintf(fb, sizeof(fb), "Running: %.0f fps in, %.0f fps out.", measuredFps, fgFps);
+    snprintf(fb, sizeof(fb), "Running: game %.0f fps, output %.0f fps.", S.dedupe ? contentFps : measuredFps, fgFps);
     ImGui::TextColored(V4(cOk), "%s", fb);
   }
   Muted("Generates an in-between frame for every real one using AMD's video frame interpolation. Adds about half a "
         "frame of delay, so it's best for watching and recording rather than playing off the preview.");
+  Muted("Skip duplicate frames: a 30 fps game captured at 60 fps sends every frame twice. Skipping the repeats "
+        "turns it into smooth 60 fps instead of interpolating between identical pictures.");
   if (S.frameGen && fx.Ready() && displayHz < S.fps * 2) {
     char hb[160];
     snprintf(hb, sizeof(hb), "Your display runs at %d Hz, so the extra frames only show up in recordings.", displayHz);
@@ -1413,11 +1476,13 @@ void App::Sidebar() {
   row("Mode", cap->IsOpen() ? b : "-");
   snprintf(b, sizeof(b), "%.1f fps", measuredFps);
   row("Frame rate", cap->IsOpen() ? b : "-");
+  snprintf(b, sizeof(b), "%.0f fps", contentFps);
+  row("Game frame rate", cap->IsOpen() ? b : "-");
   ColorParams cp = Color();
   row("Colour", std::string(cp.fullRange ? "Full" : "Limited") + (cp.bt709 ? " - BT.709" : " - BT.601"));
   row("Audio", acap->IsOpen() ? acap->formatDesc : (audErr.empty() ? "None" : "Error"));
   row("GPU", g_gpuName);
-  row("Encoder", rec.encoderName.empty() ? "H.264 / AAC (MP4)" : rec.encoderName);
+  row("Encoder", lastEncoder.empty() ? "H.264 / AAC (MP4)" : lastEncoder);
   row("AMD AMF", fx.Ready() ? fx.version : "Not available");
   row("Display", std::to_string(displayHz) + " Hz");
   Divider(s);
@@ -1533,9 +1598,11 @@ void App::BottomBar(float h) {
   ImGui::PopFont();
   std::string sub = "Ready";
   if (recording) {
-    sub = FmtSize(recBytes) + (recEnh ? "  Enhanced" : "") + "  " + std::to_string(rec.cfg.h) + "p" +
-          std::to_string((int)std::lround(double(rec.cfg.fpsN) / std::max<UINT32>(1, rec.cfg.fpsD)));
-    if (rec.dropped) sub += "  " + std::to_string(rec.dropped.load()) + " dropped";
+    if (rec) {
+      sub = FmtSize(recBytes) + (recEnh ? "  Enhanced" : "") + "  " + std::to_string(rec->cfg.h) + "p" +
+            std::to_string((int)std::lround(double(rec->cfg.fpsN) / std::max<UINT32>(1, rec->cfg.fpsD)));
+      if (rec->dropped) sub += "  " + std::to_string(rec->dropped.load()) + " dropped";
+    }
   }
   dl->AddText(ImVec2(tx, cy + 8 * s), Col(cDim), sub.c_str());
 
