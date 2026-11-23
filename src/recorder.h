@@ -6,6 +6,9 @@ struct RecordConfig {
   UINT32 w = 1920, h = 1080, fpsN = 60, fpsD = 1;
   UINT32 mbps = 20;
   bool audio = true;
+  // Video arrives already encoded as H.264 (AMD encoder); the sink writer only muxes it.
+  bool preEncoded = false;
+  std::vector<uint8_t> seqHeader;  // SPS/PPS (Annex B); parsed from the first keyframe if empty
 };
 
 // MP4 writer: H.264 (hardware encoder when available) + AAC, fed from any thread.
@@ -18,6 +21,8 @@ class Recorder {
 
   // NV12, tightly packed w*h*3/2. `t` is Now100ns() at capture.
   void PushVideo(const uint8_t* nv12, size_t size, int64_t t);
+  // Pre-encoded H.264 access unit (Annex B). `t` is Now100ns() of the frame.
+  void PushEncoded(const uint8_t* data, size_t size, int64_t t, bool key);
   // Interleaved stereo float @ 48 kHz; `t` is Now100ns() when the chunk ended.
   void PushAudio(const float* stereo, size_t frames, int64_t t);
 
@@ -33,6 +38,7 @@ class Recorder {
     bool video;
     int64_t t;
     std::vector<uint8_t> data;
+    bool key = false;
   };
   void Run(std::promise<std::string>* prom);
 

@@ -2,6 +2,9 @@
 
 #include "components/FRC.h"
 #include "components/HQScaler.h"
+#include "components/VideoConverter.h"
+#include "components/VideoEncoderVCE.h"
+#include "core/Buffer.h"
 #include "core/Factory.h"
 
 static std::string AmfErr(AMF_RESULT r) { return "AMF error " + std::to_string((int)r); }
@@ -23,6 +26,9 @@ struct AmdFx::Impl {
     float sharp = -1;
     amf::AMFSurfacePtr held;
   } sc[2];
+  // Encoder
+  amf::AMFComponentPtr conv, enc;
+  std::vector<EncodedPacket> pending;
 
   void TerminateAll() {
     held[0] = nullptr;
@@ -34,6 +40,10 @@ struct AmdFx::Impl {
       if (s.c) s.c->Terminate();
       s.c = nullptr;
     }
+    if (conv) conv->Terminate();
+    if (enc) enc->Terminate();
+    conv = nullptr;
+    enc = nullptr;
     if (ctx) ctx->Terminate();
     ctx = nullptr;
   }
@@ -218,4 +228,151 @@ ID3D11Texture2D* AmdFx::Scale(int slot, ID3D11Texture2D* in, UINT inW, UINT inH,
     if (r != AMF_OK && r != AMF_REPEAT) break;
   }
   return nullptr;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// H.264 encoder
+
+bool AmdFx::EncActive() const { return p_->enc != nullptr; }
+
+void AmdFx::EncStop() {
+  if (p_->conv) p_->conv->Terminate();
+  if (p_->enc) p_->enc->Terminate();
+  p_->conv = nullptr;
+  p_->enc = nullptr;
+  p_->pending.clear();
+}
+
+bool AmdFx::EncStart(UINT w, UINT h, UINT fpsN, UINT fpsD, UINT mbps, std::vector<uint8_t>& header, std::string& err) {
+  EncStop();
+  if (!ready_) {
+    err = status;
+    return false;
+  }
+  amf::AMFComponentPtr conv, enc;
+  AMF_RESULT r = p_->factory->CreateComponent(p_->ctx, AMFVideoConverter, &conv);
+  if (r != AMF_OK || !conv) {
+    err = "AMD colour converter unavailable (" + AmfErr(r) + ")";
+    return false;
+  }
+  conv->SetProperty(AMF_VIDEO_CONVERTER_MEMORY_TYPE, (amf_int64)amf::AMF_MEMORY_DX11);
+  conv->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_FORMAT, (amf_int64)amf::AMF_SURFACE_NV12);
+  conv->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_SIZE, AMFConstructSize((amf_int32)w, (amf_int32)h));
+  conv->SetProperty(AMF_VIDEO_CONVERTER_COLOR_PROFILE, (amf_int64)AMF_VIDEO_CONVERTER_COLOR_PROFILE_709);
+  conv->SetProperty(AMF_VIDEO_CONVERTER_INPUT_COLOR_RANGE, (amf_int64)AMF_COLOR_RANGE_FULL);
+  conv->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_COLOR_RANGE, (amf_int64)AMF_COLOR_RANGE_STUDIO);
+  conv->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_COLOR_PRIMARIES, (amf_int64)AMF_COLOR_PRIMARIES_BT709);
+  conv->SetProperty(AMF_VIDEO_CONVERTER_OUTPUT_TRANSFER_CHARACTERISTIC, (amf_int64)AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709);
+  r = conv->Init(amf::AMF_SURFACE_RGBA, (amf_int32)w, (amf_int32)h);
+  if (r != AMF_OK) {
+    err = "AMD colour converter failed to start (" + AmfErr(r) + ")";
+    return false;
+  }
+
+  r = p_->factory->CreateComponent(p_->ctx, AMFVideoEncoderVCE_AVC, &enc);
+  if (r != AMF_OK || !enc) {
+    err = "AMD H.264 encoder unavailable (" + AmfErr(r) + ")";
+    conv->Terminate();
+    return false;
+  }
+  double fps = double(fpsN) / std::max<UINT>(1, fpsD);
+  amf_int64 bits = amf_int64(mbps) * 1000000;
+  enc->SetProperty(AMF_VIDEO_ENCODER_USAGE, (amf_int64)AMF_VIDEO_ENCODER_USAGE_TRANSCODING);  // must be first
+  enc->SetProperty(AMF_VIDEO_ENCODER_PROFILE, (amf_int64)AMF_VIDEO_ENCODER_PROFILE_HIGH);
+  enc->SetProperty(AMF_VIDEO_ENCODER_PROFILE_LEVEL, (amf_int64)AMF_H264_LEVEL__5_2);
+  enc->SetProperty(AMF_VIDEO_ENCODER_FRAMESIZE, AMFConstructSize((amf_int32)w, (amf_int32)h));
+  enc->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, AMFConstructRate(fpsN, std::max<UINT>(1, fpsD)));
+  enc->SetProperty(AMF_VIDEO_ENCODER_B_PIC_PATTERN, (amf_int64)0);  // no B-frames: output order == input order
+  enc->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET, (amf_int64)AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY);
+  enc->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, (amf_int64)AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR);
+  enc->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, bits);
+  enc->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, bits * 3 / 2);
+  enc->SetProperty(AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE, bits);
+  amf_int64 gop = std::max<amf_int64>(1, amf_int64(fps * 2 + 0.5));  // keyframe every 2 s
+  enc->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, gop);
+  enc->SetProperty(AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING, gop);
+  enc->SetProperty(AMF_VIDEO_ENCODER_OUTPUT_COLOR_PROFILE, (amf_int64)AMF_VIDEO_CONVERTER_COLOR_PROFILE_709);
+  enc->SetProperty(AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC, (amf_int64)AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709);
+  enc->SetProperty(AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES, (amf_int64)AMF_COLOR_PRIMARIES_BT709);
+  r = enc->Init(amf::AMF_SURFACE_NV12, (amf_int32)w, (amf_int32)h);
+  if (r != AMF_OK) {
+    err = "AMD H.264 encoder rejected " + std::to_string(w) + "x" + std::to_string(h) + " (" + AmfErr(r) + ")";
+    conv->Terminate();
+    enc->Terminate();
+    return false;
+  }
+  header.clear();
+  amf::AMFVariant v;
+  if (enc->GetProperty(AMF_VIDEO_ENCODER_EXTRADATA, &v) == AMF_OK && v.type == amf::AMF_VARIANT_INTERFACE && v.pInterface) {
+    amf::AMFInterfacePtr ip(v.pInterface);
+    amf::AMFBufferPtr buf(ip);
+    if (buf && buf->GetSize())
+      header.assign((uint8_t*)buf->GetNative(), (uint8_t*)buf->GetNative() + buf->GetSize());
+  }
+  p_->conv = conv;
+  p_->enc = enc;
+  Log("AMF H.264 encoder %ux%u @ %.2f fps, %u Mbps, header %zu bytes", w, h, fps, mbps, header.size());
+  return true;
+}
+
+static void CollectEncoded(amf::AMFComponent* enc, std::vector<EncodedPacket>& out, AMF_RESULT& last) {
+  for (;;) {
+    amf::AMFDataPtr d;
+    last = enc->QueryOutput(&d);
+    if (!d) return;
+    amf::AMFBufferPtr b(d);
+    if (!b) continue;
+    EncodedPacket p;
+    auto* bytes = (uint8_t*)b->GetNative();
+    p.data.assign(bytes, bytes + b->GetSize());
+    p.pts = d->GetPts();
+    amf_int64 type = -1;
+    d->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &type);
+    p.key = type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR || type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_I;
+    out.push_back(std::move(p));
+  }
+}
+
+bool AmdFx::EncSubmit(ID3D11Texture2D* rgba, int64_t pts, int64_t dur) {
+  if (!p_->enc || !p_->conv) return false;
+  amf::AMFSurfacePtr in;
+  if (p_->ctx->CreateSurfaceFromDX11Native(rgba, &in, nullptr) != AMF_OK || !in) return false;
+  AMF_RESULT r = p_->conv->SubmitInput(in);
+  if (r != AMF_OK) {
+    Log("AMF converter SubmitInput: %d", (int)r);
+    return false;
+  }
+  amf::AMFDataPtr nv12;
+  for (int i = 0; i < 3 && !nv12; i++) p_->conv->QueryOutput(&nv12);
+  if (!nv12) return true;  // skip this frame rather than fail the recording
+  nv12->SetPts(pts);
+  nv12->SetDuration(dur);
+  for (int tries = 0; tries < 100; tries++) {
+    r = p_->enc->SubmitInput(nv12);
+    if (r != AMF_INPUT_FULL) break;
+    AMF_RESULT q;
+    CollectEncoded(p_->enc, p_->pending, q);
+    Sleep(1);
+  }
+  if (r != AMF_OK) Log("AMF encoder SubmitInput: %d", (int)r);
+  return r == AMF_OK || r == AMF_INPUT_FULL;
+}
+
+void AmdFx::EncPoll(std::vector<EncodedPacket>& out, bool drain) {
+  if (!p_->enc) return;
+  for (auto& p : p_->pending) out.push_back(std::move(p));
+  p_->pending.clear();
+  AMF_RESULT last = AMF_OK;
+  if (!drain) {
+    CollectEncoded(p_->enc, out, last);
+    return;
+  }
+  p_->enc->Drain();
+  int64_t until = Now100ns() + 30000000;  // 3 s
+  while (Now100ns() < until) {
+    CollectEncoded(p_->enc, out, last);
+    if (last == AMF_EOF) break;
+    Sleep(1);
+  }
+  if (last != AMF_EOF) Log("AMF encoder drain timed out");
 }

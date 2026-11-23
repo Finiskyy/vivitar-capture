@@ -276,7 +276,9 @@ class App {
 
   // AMD effects
   AmdFx fx;
-  bool fgFailed = false, fgWas = false, recGpu = false;
+  bool fgFailed = false, fgWas = false, recGpu = false, recAmf = false;
+  int64_t recFrameDur = 166667;
+  std::vector<EncodedPacket> packets;
   struct FgFrame {
     RenderTarget rt;
     int64_t t = 0;
@@ -566,6 +568,11 @@ void App::Tick() {
     cap->Recycle(frames);
   }
   if (R.HasFrame() && !converted) R.Convert(color, enh.denoise);
+  if (recording && recAmf && rec) {
+    packets.clear();
+    fx.EncPoll(packets, false);
+    for (auto& p : packets) rec->PushEncoded(p.data.data(), p.data.size(), p.pts, p.key);
+  }
 
   if (now - fpsT >= 1.0) {
     measuredFps = frameCount / (now - fpsT);
@@ -695,6 +702,10 @@ void App::RecordFrame(const SrcOverride* ov, int64_t t) {
   if (recEnh) OutSize(rw, rh);
   R.Ensure(recRT, rw, rh, DXGI_FORMAT_R8G8B8A8_UNORM);
   DrawUp(recRT, FitContain, recEnh ? Enh() : EnhanceParams{}, Color(), -1.f, 1.f, ov, 1, recEnh);
+  if (recAmf) {
+    if (!fx.EncSubmit(recRT.tex.Get(), t, recFrameDur)) Log("AMF encode submit failed");
+    return;
+  }
   R.SubmitNV12(recRT, t);
   R.CollectNV12([this](const uint8_t* d, size_t n, int64_t ts) { if (rec) rec->PushVideo(d, n, ts); }, false);
 }
@@ -740,15 +751,30 @@ void App::StartRecording() {
   }
   cfg.mbps = S.bitrate;
   cfg.audio = acap->IsOpen();
+  // On AMD, encode on the GPU with AMF and let Media Foundation only write the file.
+  recAmf = false;
+  if (fx.Ready()) {
+    std::string eerr;
+    if (fx.EncStart(cfg.w, cfg.h, cfg.fpsN, cfg.fpsD, cfg.mbps, cfg.seqHeader, eerr)) {
+      recAmf = true;
+      cfg.preEncoded = true;
+      recGpu = true;
+    } else {
+      Log("AMF encoder unavailable, using Media Foundation: %s", eerr.c_str());
+    }
+  }
+  recFrameDur = int64_t(10000000.0 * cfg.fpsD / std::max<UINT32>(1, cfg.fpsN));
   cfg.path = S.saveDir + L"\\Vivitar Capture " + TimestampName() + L".mp4";
   recStart = Now100ns();
   std::string err;
   auto r = std::make_shared<Recorder>();
   if (!r->Start(cfg, recStart, err)) {
+    if (recAmf) fx.EncStop();
+    recAmf = false;
     ToastMsg(err, cRec, 8);
     return;
   }
-  lastEncoder = r->encoderName;
+  lastEncoder = recAmf ? "AMD hardware encoder (AMF)" : r->encoderName;
   {
     std::lock_guard<std::mutex> lk(recM);
     rec = r;
@@ -763,7 +789,17 @@ void App::StartRecording() {
 void App::StopRecording() {
   if (!recording) return;
   cap->SetOnFrame(nullptr);
-  if (recGpu && rec) R.CollectNV12([this](const uint8_t* d, size_t n, int64_t t) { rec->PushVideo(d, n, t); }, true);
+  if (recAmf) {
+    packets.clear();
+    fx.EncPoll(packets, true);
+    if (rec)
+      for (auto& p : packets) rec->PushEncoded(p.data.data(), p.data.size(), p.pts, p.key);
+    packets.clear();
+    fx.EncStop();
+    recAmf = false;
+  } else if (recGpu && rec) {
+    R.CollectNV12([this](const uint8_t* d, size_t n, int64_t t) { rec->PushVideo(d, n, t); }, true);
+  }
   recording = false;
   std::shared_ptr<Recorder> r;
   {

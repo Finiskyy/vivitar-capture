@@ -21,6 +21,8 @@ bool Recorder::Start(const RecordConfig& c, int64_t startTime, std::string& err)
   audioFrames_ = 0;
   audioBase_ = 0;
   encoderName.clear();
+  result.clear();
+  container.clear();
   std::promise<std::string> prom;
   auto fut = prom.get_future();
   th_ = std::thread([this, &prom] { Run(&prom); });
@@ -70,6 +72,47 @@ void Recorder::PushVideo(const uint8_t* nv12, size_t size, int64_t t) {
   cv_.notify_one();
 }
 
+void Recorder::PushEncoded(const uint8_t* data, size_t size, int64_t t, bool key) {
+  if (!active_) return;
+  int64_t rel = t - start_;
+  if (rel < 0) return;
+  std::lock_guard<std::mutex> lk(m_);
+  Item it{true, rel, std::vector<uint8_t>(data, data + size), key};
+  q_.push_back(std::move(it));
+  queuedVideo_++;
+  cv_.notify_one();
+}
+
+// Pulls SPS (7) and PPS (8) NAL units out of an Annex B access unit.
+static std::vector<uint8_t> ExtractParamSets(const std::vector<uint8_t>& au) {
+  std::vector<uint8_t> out;
+  size_t n = au.size(), i = 0;
+  auto startAt = [&](size_t p) -> size_t {  // returns start-code length at p, or 0
+    if (p + 3 <= n && au[p] == 0 && au[p + 1] == 0 && au[p + 2] == 1) return 3;
+    if (p + 4 <= n && au[p] == 0 && au[p + 1] == 0 && au[p + 2] == 0 && au[p + 3] == 1) return 4;
+    return 0;
+  };
+  while (i < n) {
+    size_t sc = startAt(i);
+    if (!sc) {
+      i++;
+      continue;
+    }
+    size_t b = i + sc, e = b;
+    while (e < n && !startAt(e)) e++;
+    if (b < n) {
+      int type = au[b] & 0x1f;
+      if (type == 7 || type == 8) {
+        static const uint8_t code[4] = {0, 0, 0, 1};
+        out.insert(out.end(), code, code + 4);
+        out.insert(out.end(), au.begin() + b, au.begin() + e);
+      }
+    }
+    i = e;
+  }
+  return out;
+}
+
 void Recorder::PushAudio(const float* s, size_t frames, int64_t t) {
   if (!active_ || !cfg.audio || !frames) return;
   std::lock_guard<std::mutex> lk(m_);
@@ -97,7 +140,7 @@ void Recorder::PushAudio(const float* s, size_t frames, int64_t t) {
   cv_.notify_one();
 }
 
-static HRESULT AddSample(IMFSinkWriter* w, DWORD stream, const std::vector<uint8_t>& data, int64_t t, int64_t dur) {
+static HRESULT AddSample(IMFSinkWriter* w, DWORD stream, const std::vector<uint8_t>& data, int64_t t, int64_t dur, bool key) {
   ComPtr<IMFMediaBuffer> buf;
   HRESULT hr = MFCreateMemoryBuffer((DWORD)data.size(), &buf);
   if (FAILED(hr)) return hr;
@@ -113,6 +156,7 @@ static HRESULT AddSample(IMFSinkWriter* w, DWORD stream, const std::vector<uint8
   s->AddBuffer(buf.Get());
   s->SetSampleTime(t);
   s->SetSampleDuration(dur);
+  if (key) s->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
   return w->WriteSample(stream, s.Get());
 }
 
@@ -133,6 +177,25 @@ void Recorder::Run(std::promise<std::string>* prom) {
     if (FAILED(hr)) return "Couldn't create the video file (" + HrStr(hr) + ").";
 
     ComPtr<IMFMediaType> vout, vin;
+    if (cfg.preEncoded) {
+      // Passthrough: input type == output type, so no Media Foundation encoder is involved at all.
+      MFCreateMediaType(&vout);
+      vout->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+      vout->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+      vout->SetUINT32(MF_MT_AVG_BITRATE, cfg.mbps * 1000000);
+      vout->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+      vout->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High);
+      MFSetAttributeSize(vout.Get(), MF_MT_FRAME_SIZE, cfg.w, cfg.h);
+      MFSetAttributeRatio(vout.Get(), MF_MT_FRAME_RATE, cfg.fpsN, cfg.fpsD);
+      MFSetAttributeRatio(vout.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+      if (!cfg.seqHeader.empty())
+        vout->SetBlob(MF_MT_MPEG_SEQUENCE_HEADER, cfg.seqHeader.data(), (UINT32)cfg.seqHeader.size());
+      hr = w->AddStream(vout.Get(), &vs);
+      if (FAILED(hr)) return "Couldn't add the video track (" + HrStr(hr) + ").";
+      hr = w->SetInputMediaType(vs, vout.Get(), nullptr);
+      if (FAILED(hr)) return "Couldn't set up the video track (" + HrStr(hr) + ").";
+      encoderName = "AMD hardware encoder (AMF)";
+    } else {
     MFCreateMediaType(&vout);
     vout->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     vout->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
@@ -160,6 +223,7 @@ void Recorder::Run(std::promise<std::string>* prom) {
     vin->SetUINT32(MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709);
     hr = w->SetInputMediaType(vs, vin.Get(), nullptr);
     if (FAILED(hr)) return "The H.264 encoder rejected the video input (" + HrStr(hr) + ").";
+    }
 
     if (cfg.audio) {
       ComPtr<IMFMediaType> aout, ain;
@@ -188,7 +252,7 @@ void Recorder::Run(std::promise<std::string>* prom) {
 
     // Which encoder did Windows pick? (Useful to confirm the AMD hardware encoder is in use.)
     ComPtr<IMFSinkWriterEx> wx;
-    if (SUCCEEDED(w.As(&wx))) {
+    if (!cfg.preEncoded && SUCCEEDED(w.As(&wx))) {
       for (DWORD i = 0;; i++) {
         GUID cat{};
         ComPtr<IMFTransform> t;
@@ -211,19 +275,26 @@ void Recorder::Run(std::promise<std::string>* prom) {
         cfg.mbps, encoderName.c_str());
     return {};
   };
-  std::string err = setup(true);
-  if (!err.empty()) {
-    Log("Fragmented MP4 unavailable (%s), using regular MP4", err.c_str());
-    w.Reset();
-    DeleteFileW(cfg.path.c_str());
-    err = setup(false);
-  }
+  auto setupAny = [&]() -> std::string {
+    std::string e = setup(true);
+    if (!e.empty()) {
+      Log("Fragmented MP4 unavailable (%s), using regular MP4", e.c_str());
+      w.Reset();
+      DeleteFileW(cfg.path.c_str());
+      e = setup(false);
+    }
+    return e;
+  };
+  std::string err;
+  if (!cfg.preEncoded) err = setupAny();
   prom->set_value(err);
   if (!err.empty()) {
     Log("Recorder start failed: %s", err.c_str());
     CoUninitialize();
     return;
   }
+  // Pre-encoded video: the file is created when the first keyframe arrives (it carries SPS/PPS).
+  std::deque<Item> early;
 
   const int64_t frameDur = int64_t(10000000.0 * cfg.fpsD / std::max<UINT32>(1, cfg.fpsN));
   int64_t lastVideo = -1;
@@ -240,11 +311,37 @@ void Recorder::Run(std::promise<std::string>* prom) {
       q_.pop_front();
       if (it.video) queuedVideo_--;
     }
+    if (!w) {
+      // Waiting for the first keyframe before the file can be created.
+      if (it.video && it.key) {
+        if (cfg.seqHeader.empty()) cfg.seqHeader = ExtractParamSets(it.data);
+        Log("Recorder: first keyframe at %.3fs, header %zu bytes", it.t / 1e7, cfg.seqHeader.size());
+        std::string e = setupAny();
+        if (!e.empty()) {
+          result = e;
+          Log("Recorder start failed: %s", e.c_str());
+          std::unique_lock<std::mutex> lk(m_);
+          cv_.wait(lk, [&] { return stop_.load(); });
+          q_.clear();
+          break;
+        }
+        while (!early.empty() && early.front().t < it.t) early.pop_front();  // audio from the keyframe onwards
+      } else {
+        if (!it.video) early.push_back(std::move(it));
+        continue;
+      }
+    }
+    while (!early.empty() && w) {
+      Item& a = early.front();
+      HRESULT ah = AddSample(w.Get(), as, a.data, a.t, int64_t(a.data.size() / 4) * 10000000LL / 48000, false);
+      if (SUCCEEDED(ah)) nAudio++;
+      early.pop_front();
+    }
     if (it.video) {
       int64_t t = it.t;
       if (t <= lastVideo) t = lastVideo + 1;
       lastVideo = t;
-      hr = AddSample(w.Get(), vs, it.data, t, frameDur);
+      hr = AddSample(w.Get(), vs, it.data, t, frameDur, cfg.preEncoded && it.key);
       if (SUCCEEDED(hr)) {
         if (firstV < 0) firstV = t;
         nVideo++;
@@ -252,7 +349,7 @@ void Recorder::Run(std::promise<std::string>* prom) {
       std::lock_guard<std::mutex> lk(m_);
       if (pool_.size() < 4) pool_.push_back(std::move(it.data));
     } else {
-      hr = AddSample(w.Get(), as, it.data, it.t, int64_t(it.data.size() / 4) * 10000000LL / 48000);
+      hr = AddSample(w.Get(), as, it.data, it.t, int64_t(it.data.size() / 4) * 10000000LL / 48000, false);
       if (SUCCEEDED(hr)) {
         if (firstA < 0) firstA = it.t;
         lastA = it.t;
@@ -270,9 +367,10 @@ void Recorder::Run(std::promise<std::string>* prom) {
       nVideo, firstV / 1e7, lastVideo / 1e7, nAudio, firstA / 1e7, lastA / 1e7, nFail, dropped.load());
   if (cfg.audio && nAudio == 0 && nVideo > 0) Log("Note: audio track was set up but no audio arrived");
   int64_t f0 = Now100ns();
-  hr = w->Finalize();
+  hr = w ? w->Finalize() : E_FAIL;
   Log("Finalize: %s (%.0f ms)", HrStr(hr).c_str(), (Now100ns() - f0) / 10000.0);
-  if (nVideo == 0) result = "No video frames reached the encoder.";
+  if (!result.empty()) {
+  } else if (nVideo == 0) result = "No video frames reached the encoder.";
   else if (FAILED(firstErr)) result = "The encoder rejected the video (" + HrStr(firstErr) + ").";
   else if (FAILED(hr) && container != "fragmented MP4") result = "Couldn't finish the file (" + HrStr(hr) + ").";
   else result.clear();

@@ -7,6 +7,12 @@
 //  - FRC: frame generation (doubles the frame rate by interpolating in-between frames)
 //  - HQ Scaler: AMD VideoSR upscaling (FSR-based video upscaler)
 // Everything here runs on the UI thread with the app's D3D11 device.
+struct EncodedPacket {
+  std::vector<uint8_t> data;  // H.264 Annex B
+  int64_t pts = 0;            // same clock as submitted (Now100ns)
+  bool key = false;
+};
+
 class AmdFx {
  public:
   AmdFx();
@@ -27,6 +33,14 @@ class AmdFx {
   // Returns an AMF-owned texture (valid until the next call for that slot) or nullptr.
   ID3D11Texture2D* Scale(int slot, ID3D11Texture2D* in, UINT inW, UINT inH, UINT outW, UINT outH, int algo, float sharp);
   bool ScaleFailed() const { return scaleFailed_; }
+
+  // Hardware H.264 encoding straight from GPU textures (RGBA in, converted to NV12 by AMF).
+  bool EncStart(UINT w, UINT h, UINT fpsN, UINT fpsD, UINT mbps, std::vector<uint8_t>& header, std::string& err);
+  bool EncSubmit(ID3D11Texture2D* rgba, int64_t pts, int64_t dur);
+  // Collects finished packets. With drain=true, flushes the encoder and waits (up to ~3 s) for everything.
+  void EncPoll(std::vector<EncodedPacket>& out, bool drain);
+  void EncStop();
+  bool EncActive() const;
 
  private:
   struct Impl;
