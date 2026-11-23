@@ -16,6 +16,7 @@
 #include <wincodec.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <map>
 #include <set>
@@ -178,6 +179,8 @@ struct LibItem {
   bool video = false;
 };
 
+static double NowSecs() { return double(Now100ns()) / 1e7; }
+
 class App {
  public:
   float s = 1.f;  // DPI scale
@@ -214,7 +217,10 @@ class App {
   EnhanceParams Enh() const;
   void OutSize(UINT& w, UINT& h) const;
   void ApplyPreset(int p);
-  void Dirty() { settingsDirty = true; }
+  void Dirty() {
+    settingsDirty = true;
+    lastChange = NowSecs();
+  }
   void UpdateMonitorVolume();
   // ui pieces
   void TopBar(float h);
@@ -230,10 +236,18 @@ class App {
 
   Settings S;
   bool settingsDirty = false;
-  double lastSave = 0;
+  double lastSave = 0, lastChange = 0;
 
-  VideoCapture cap;
-  AudioCapture acap;
+  struct OpenResult {
+    std::unique_ptr<VideoCapture> cap;
+    std::unique_ptr<AudioCapture> acap;
+    std::string capErr, audErr;
+  };
+  std::unique_ptr<VideoCapture> cap = std::make_unique<VideoCapture>();
+  std::unique_ptr<AudioCapture> acap = std::make_unique<AudioCapture>();
+  std::future<OpenResult> opening;
+  bool reopenQueued = false;
+  void FinishOpen(OpenResult r);
   AudioMonitor mon;
   Recorder rec;
   Renderer R;
@@ -278,10 +292,6 @@ void App::Init() {
   S.Load();
   std::string err;
   if (!R.Init(g_dev.Get(), g_ctx.Get(), err)) ToastMsg(err, cRec, 10);
-  acap.onAudio = [this](const float* d, size_t n, int64_t t) {
-    mon.Push(d, n);
-    rec.PushAudio(d, n, t);
-  };
   UpdateMonitorVolume();
   mon.Start();
   Scan();
@@ -290,8 +300,9 @@ void App::Init() {
 
 void App::Shutdown() {
   if (recording) StopRecording();
-  cap.Close();
-  acap.Close();
+  if (opening.valid()) FinishOpen(opening.get());
+  cap->Close();
+  acap->Close();
   mon.Stop();
   S.Save();
 }
@@ -334,37 +345,57 @@ std::wstring App::PickAudio(const std::wstring& videoName) {
   return L"";
 }
 
+// Closing and opening devices can take a second or more, so it happens on a worker thread.
 void App::OpenDevice() {
   if (recording) StopRecording();
-  acap.Close();
-  cap.Close();
+  if (opening.valid()) {
+    reopenQueued = true;
+    return;
+  }
   capErr.clear();
   audErr.clear();
   std::wstring vid = PickVideo();
-  if (vid.empty()) {
-    capErr = "nodevice";
-    return;
-  }
   curVideoName.clear();
   for (auto& d : vids)
     if (d.id == vid) curVideoName = d.name;
+  std::wstring aud = PickAudio(curVideoName);
   CaptureRequest req;
   req.id = vid;
   req.w = S.width;
   req.h = S.height;
   req.fps = S.fps;
   req.fmtPref = S.fmtPref;
-  std::string err;
-  if (!cap.Open(req, err)) {
-    capErr = err;
-    return;
-  }
-  everOpened = true;
-  std::wstring aud = PickAudio(curVideoName);
-  if (!aud.empty() && !acap.Open(aud, err)) {
-    audErr = err;
-    ToastMsg(err, cWarn, 6);
-  }
+  auto oldCap = std::move(cap);
+  auto oldAud = std::move(acap);
+  cap = std::make_unique<VideoCapture>();
+  acap = std::make_unique<AudioCapture>();
+  opening = std::async(std::launch::async, [this, req, aud, oldCap = std::move(oldCap), oldAud = std::move(oldAud)]() mutable {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    oldAud.reset();  // destructors close the devices
+    oldCap.reset();
+    OpenResult r;
+    r.cap = std::make_unique<VideoCapture>();
+    r.acap = std::make_unique<AudioCapture>();
+    r.acap->onAudio = [this](const float* d, size_t n, int64_t t) {
+      mon.Push(d, n);
+      rec.PushAudio(d, n, t);
+    };
+    std::string err;
+    if (req.id.empty()) r.capErr = "nodevice";
+    else if (!r.cap->Open(req, err)) r.capErr = err;
+    else if (!aud.empty() && !r.acap->Open(aud, err)) r.audErr = err;
+    CoUninitialize();
+    return r;
+  });
+}
+
+void App::FinishOpen(OpenResult r) {
+  cap = std::move(r.cap);
+  acap = std::move(r.acap);
+  capErr = r.capErr;
+  audErr = r.audErr;
+  if (!audErr.empty()) ToastMsg(audErr, cWarn, 6);
+  if (cap->IsOpen()) everOpened = true;
   measuredFps = 0;
 }
 
@@ -372,7 +403,7 @@ ColorParams App::Color() const {
   ColorParams c;
   if (S.range == 1) c.fullRange = false;
   else if (S.range == 2) c.fullRange = true;
-  else c.fullRange = cap.nominalRange == 1;
+  else c.fullRange = cap->nominalRange == 1;
   c.bt709 = R.srcH == 0 || R.srcH >= 720;
   return c;
 }
@@ -421,17 +452,39 @@ void App::ToastMsg(const std::string& t, uint32_t c, double secs) {
 void App::Tick() {
   double now = NowSec();
 
+  // Background open finished?
+  if (opening.valid() && opening.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+    FinishOpen(opening.get());
+    if (reopenQueued) {
+      reopenQueued = false;
+      OpenDevice();
+    }
+  }
   // Device loss / reconnect
-  if (cap.IsOpen() && cap.Lost()) {
+  if (!opening.valid() && cap->IsOpen() && cap->Lost()) {
     if (recording) StopRecording();
-    cap.Close();
-    acap.Close();
     capErr = "lost";
+    // Close the old devices off the UI thread (their destructors can wait on the driver).
+    std::thread([c = std::move(cap), a = std::move(acap)]() mutable {
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      a.reset();
+      c.reset();
+      CoUninitialize();
+    }).detach();
+    cap = std::make_unique<VideoCapture>();
+    acap = std::make_unique<AudioCapture>();
     ToastMsg("Capture card disconnected", cWarn);
     nextScan = now + 1;
   }
-  if (acap.IsOpen() && acap.Lost()) acap.Close();
-  if (!cap.IsOpen() && now > nextScan && (capErr == "nodevice" || capErr == "lost")) {
+  if (!opening.valid() && acap->IsOpen() && acap->Lost()) {
+    std::thread([a = std::move(acap)]() mutable {
+      CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+      a.reset();
+      CoUninitialize();
+    }).detach();
+    acap = std::make_unique<AudioCapture>();
+  }
+  if (!opening.valid() && !cap->IsOpen() && now > nextScan && (capErr == "nodevice" || capErr == "lost")) {
     nextScan = now + 2;
     Scan();
     if (!PickVideo().empty()) OpenDevice();
@@ -439,7 +492,7 @@ void App::Tick() {
 
   // Frames
   frames.clear();
-  cap.TakeFrames(frames);
+  cap->TakeFrames(frames);
   ColorParams color = Color();
   EnhanceParams enh = Enh();
   if (!frames.empty()) {
@@ -458,7 +511,7 @@ void App::Tick() {
     } else {
       R.Upload(frames.back());
     }
-    cap.Recycle(frames);
+    cap->Recycle(frames);
   }
   if (R.HasFrame()) R.Convert(color, enh.denoise);
 
@@ -477,14 +530,14 @@ void App::Tick() {
     float db = 20.f * std::log10(std::max(v, 1e-6f));
     return std::clamp((db + 60.f) / 60.f, 0.f, 1.f);
   };
-  float l = pct(acap.peakL.exchange(0)), r = pct(acap.peakR.exchange(0));
+  float l = pct(acap->peakL.exchange(0)), r = pct(acap->peakR.exchange(0));
   float dt = ImGui::GetIO().DeltaTime;
   meterL = std::max(l, meterL - dt * 1.2f);
   meterR = std::max(r, meterR - dt * 1.2f);
   if (meterL >= peakHoldL || now - peakTL > 1.2) peakHoldL = meterL, peakTL = now;
   if (meterR >= peakHoldR || now - peakTR > 1.2) peakHoldR = meterR, peakTR = now;
 
-  if (settingsDirty && now - lastSave > 1.0) {
+  if (settingsDirty && now - lastChange > 0.75) {
     S.Save();
     settingsDirty = false;
     lastSave = now;
@@ -502,19 +555,19 @@ void App::RenderPreview() {
 // Actions
 
 void App::StartRecording() {
-  if (recording || !cap.IsOpen() || !R.HasFrame()) return;
+  if (recording || !cap->IsOpen() || !R.HasFrame()) return;
   SHCreateDirectoryExW(nullptr, S.saveDir.c_str(), nullptr);
   recEnh = S.enh && S.enhRecord;
   RecordConfig cfg;
   if (recEnh) OutSize(cfg.w, cfg.h);
   else {
-    cfg.w = cap.outW;
-    cfg.h = cap.outH;
+    cfg.w = cap->outW;
+    cfg.h = cap->outH;
   }
-  cfg.fpsN = cap.cur.fpsN ? cap.cur.fpsN : 60;
-  cfg.fpsD = cap.cur.fpsD ? cap.cur.fpsD : 1;
+  cfg.fpsN = cap->cur.fpsN ? cap->cur.fpsN : 60;
+  cfg.fpsD = cap->cur.fpsD ? cap->cur.fpsD : 1;
   cfg.mbps = S.bitrate;
-  cfg.audio = acap.IsOpen();
+  cfg.audio = acap->IsOpen();
   cfg.path = S.saveDir + L"\\Vivitar Capture " + TimestampName() + L".mp4";
   recStart = Now100ns();
   std::string err;
@@ -525,13 +578,13 @@ void App::StartRecording() {
   recording = true;
   recBytes = 0;
   if (recEnh) R.ResetNV12();
-  else cap.SetOnFrame([this](const VideoFrame& f) { rec.PushVideo(f.data.data(), f.data.size(), f.t); });
+  else cap->SetOnFrame([this](const VideoFrame& f) { rec.PushVideo(f.data.data(), f.data.size(), f.t); });
   ToastMsg("Recording started");
 }
 
 void App::StopRecording() {
   if (!recording) return;
-  cap.SetOnFrame(nullptr);
+  cap->SetOnFrame(nullptr);
   if (recEnh) R.CollectNV12([this](const uint8_t* d, size_t n, int64_t t) { rec.PushVideo(d, n, t); }, true);
   recording = false;
   std::wstring path = rec.cfg.path;
@@ -818,7 +871,7 @@ void App::TopBar(float h) {
   std::string st;
   uint32_t dot = cDim;
   if (recording) st = "Recording", dot = cRec;
-  else if (cap.IsOpen() && R.HasFrame()) {
+  else if (cap->IsOpen() && R.HasFrame()) {
     char b[64];
     snprintf(b, sizeof(b), "Live  %ux%u  %.0f fps", R.srcW, R.srcH, measuredFps);
     st = b;
@@ -832,7 +885,7 @@ void App::TopBar(float h) {
   dl->AddRect(pa, ImVec2(pa.x + pw, pa.y + ph), Col(cLine), ph / 2);
   float blink = recording ? (std::fmod(NowSec(), 1.0) < 0.5 ? 1.f : 0.3f) : 1.f;
   dl->AddCircleFilled(ImVec2(pa.x + 14 * s, pa.y + ph / 2), 4 * s, Col(dot, blink));
-  dl->AddText(ImVec2(pa.x + 24 * s, pa.y + (ph - ts.y) / 2), recording || cap.IsOpen() ? Col(cText) : Col(cMuted), st.c_str());
+  dl->AddText(ImVec2(pa.x + 24 * s, pa.y + (ph - ts.y) / 2), recording || cap->IsOpen() ? Col(cText) : Col(cMuted), st.c_str());
 
   // sidebar toggle (gear-ish)
   ImGui::SetCursorScreenPos(ImVec2(bx, o.y + (h - 34 * s) / 2));
@@ -864,7 +917,7 @@ void App::Stage() {
   wantPH = (int)h;
   float rnd = fullscreen ? 0 : 10 * s;
   dl->AddRectFilled(a, b, Col(0x000000), rnd);
-  bool live = cap.IsOpen() && R.HasFrame();
+  bool live = cap->IsOpen() && R.HasFrame();
   if (live && preview.srv) dl->AddImageRounded((ImTextureID)(uintptr_t)preview.srv.Get(), a, b, ImVec2(0, 0), ImVec2(1, 1), Col(0xffffff), rnd);
   if (!fullscreen) dl->AddRect(a, b, recording ? Col(cRec, 0.6f) : Col(cLine), rnd, 0, recording ? 1.5f * s : 1.f);
 
@@ -917,7 +970,8 @@ void App::Stage() {
     if (capErr == "nodevice") title = "No capture card found", body = "Plug in your Vivitar capture card over USB. It will connect automatically.";
     else if (capErr == "lost") title = "Capture card disconnected", body = "Reconnect it and it will come back automatically.";
     else if (!capErr.empty()) title = "Couldn't open the device", body = capErr;
-    else if (cap.IsOpen()) title = "Waiting for video", body = "Connected. Waiting for the first frame from the card.", rescan = false;
+    else if (opening.valid()) title = "Connecting", body = "Opening " + (curVideoName.empty() ? std::string("the capture card") : W2U(curVideoName)) + "...", rescan = false;
+    else if (cap->IsOpen()) title = "Waiting for video", body = "Connected. Waiting for the first frame from the card.", rescan = false;
     else title = "Connecting", body = "Looking for your capture card.", rescan = false;
     ImGui::PushFont(fBig);
     ImVec2 ts = ImGui::CalcTextSize(title.c_str());
@@ -1005,7 +1059,7 @@ void App::Sidebar() {
   Section("VIDEO");
   ImGui::BeginDisabled(lockRec);
   std::set<std::pair<UINT32, UINT32>> resSet;
-  for (auto& m : cap.modes) resSet.insert({m.w, m.h});
+  for (auto& m : cap->modes) resSet.insert({m.w, m.h});
   if (resSet.empty()) resSet = {{1920, 1080}, {1280, 720}};
   std::vector<std::pair<UINT32, UINT32>> resList(resSet.rbegin(), resSet.rend());
   std::sort(resList.begin(), resList.end(), [](auto& x, auto& y) { return x.first * x.second > y.first * y.second; });
@@ -1032,7 +1086,7 @@ void App::Sidebar() {
   ImGui::BeginGroup();
   ImGui::TextColored(V4(cMuted), "Frame rate");
   std::set<int> fpsSet;
-  for (auto& m : cap.modes)
+  for (auto& m : cap->modes)
     if ((int)m.w == S.width && (int)m.h == S.height) fpsSet.insert((int)std::lround(m.fps()));
   if (fpsSet.empty()) fpsSet = {60, 30};
   snprintf(lbl, sizeof(lbl), "%d fps", S.fps);
@@ -1060,7 +1114,7 @@ void App::Sidebar() {
   {
     // What formats does this card offer at the chosen resolution?
     std::map<std::string, std::set<int>> byFmt;
-    for (auto& m : cap.modes)
+    for (auto& m : cap->modes)
       if ((int)m.w == S.width && (int)m.h == S.height) byFmt[m.fmtName()].insert((int)std::lround(m.fps()));
     std::string avail;
     for (auto& [f, rates] : byFmt) {
@@ -1170,14 +1224,14 @@ void App::Sidebar() {
     ImGui::TextUnformatted(v.c_str());
   };
   char b[128];
-  row("Device", cap.IsOpen() ? W2U(curVideoName) : "-");
-  if (cap.IsOpen()) snprintf(b, sizeof(b), "%ux%u @ %.2f %s", cap.cur.w, cap.cur.h, cap.cur.fps(), cap.cur.fmtName().c_str());
-  row("Mode", cap.IsOpen() ? b : "-");
+  row("Device", cap->IsOpen() ? W2U(curVideoName) : "-");
+  if (cap->IsOpen()) snprintf(b, sizeof(b), "%ux%u @ %.2f %s", cap->cur.w, cap->cur.h, cap->cur.fps(), cap->cur.fmtName().c_str());
+  row("Mode", cap->IsOpen() ? b : "-");
   snprintf(b, sizeof(b), "%.1f fps", measuredFps);
-  row("Frame rate", cap.IsOpen() ? b : "-");
+  row("Frame rate", cap->IsOpen() ? b : "-");
   ColorParams cp = Color();
   row("Colour", std::string(cp.fullRange ? "Full" : "Limited") + (cp.bt709 ? " - BT.709" : " - BT.601"));
-  row("Audio", acap.IsOpen() ? acap.formatDesc : (audErr.empty() ? "None" : "Error"));
+  row("Audio", acap->IsOpen() ? acap->formatDesc : (audErr.empty() ? "None" : "Error"));
   row("GPU", g_gpuName);
   row("Encoder", rec.encoderName.empty() ? "H.264 / AAC (MP4)" : rec.encoderName);
   Divider(s);
@@ -1249,7 +1303,7 @@ void App::BottomBar(float h) {
   meter(cy + 6 * s, meterR, peakHoldR, "R");
 
   // centre: screenshot, record, timer
-  bool live = cap.IsOpen() && R.HasFrame();
+  bool live = cap->IsOpen() && R.HasFrame();
   float rx = o.x + W / 2;
   ImGui::SetCursorScreenPos(ImVec2(rx - 30 * s - 22 * s - 44 * s, cy - 22 * s));
   ImGui::BeginDisabled(!live);

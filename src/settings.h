@@ -22,6 +22,9 @@ struct Settings {
   bool enhRecord = true;
   int outRes = 0;  // 0 same as source, 1 1440p
 
+  bool frameGen = false;  // AMD frame generation (AMF FRC)
+  int upscaler = 0;       // 0 shader upscaler, 1 AMD AMF HQ Scaler
+
   int bitrate = 20;
   std::wstring saveDir;
 

@@ -2,6 +2,8 @@
 #include "common.h"
 
 #include <guiddef.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
 
 struct DeviceInfo {
   std::wstring name;
@@ -31,12 +33,16 @@ struct CaptureRequest {
   int fmtPref = 0;  // 0 auto (best quality), 1 prefer uncompressed, 2 prefer MJPEG
 };
 
+class ReaderCallback;
+
+// Captures from a UVC device with an asynchronous Media Foundation source reader.
+// Open() and Close() block briefly, so call them off the UI thread.
 class VideoCapture {
  public:
   ~VideoCapture() { Close(); }
   bool Open(const CaptureRequest& req, std::string& err);
   void Close();
-  bool IsOpen() const { return th_.joinable(); }
+  bool IsOpen() const { return open_; }
   bool Lost() const { return lost_; }
 
   // Moves queued frames (oldest first) into `out`; give them back with Recycle().
@@ -54,12 +60,12 @@ class VideoCapture {
   int nominalRange = 0;          // 0 unknown, 1 full (0-255), 2 limited (16-235)
 
  private:
-  void Run(CaptureRequest req, std::promise<std::string>* prom);
+  void OnSample(HRESULT hr, DWORD flags, IMFSample* s);
 
-  std::thread th_;
-  std::atomic<bool> stop_{false}, lost_{false};
-  std::mutex srcMutex_;
-  ComPtr<IUnknown> source_;  // IMFMediaSource, kept so Close() can unblock ReadSample
+  std::atomic<bool> open_{false}, stop_{false}, lost_{false};
+  ComPtr<IMFMediaSource> src_;
+  ComPtr<IMFSourceReader> reader_;
+  ReaderCallback* cb_ = nullptr;
   std::mutex qm_;
   std::deque<VideoFrame> q_;
   std::vector<VideoFrame> pool_;
@@ -70,21 +76,26 @@ class VideoCapture {
 // Audio from the capture card, delivered as float stereo @ 48 kHz.
 class AudioCapture {
  public:
-  ~AudioCapture() { Close(); }
+  AudioCapture();
+  ~AudioCapture();
   bool Open(const std::wstring& endpointId, std::string& err);
   void Close();
-  bool IsOpen() const { return th_.joinable(); }
+  bool IsOpen() const { return open_; }
   bool Lost() const { return lost_; }
 
-  // Called on the capture thread: interleaved stereo float, `frames` frames, arrival time of the chunk end.
+  // Called on a Media Foundation thread: interleaved stereo float, `frames` frames, arrival time of the chunk end.
+  // Set before Open().
   std::function<void(const float*, size_t frames, int64_t t)> onAudio;
   std::string formatDesc;
   std::atomic<float> peakL{0}, peakR{0};
 
  private:
-  void Run(std::wstring id, std::promise<std::string>* prom);
-  std::thread th_;
-  std::atomic<bool> stop_{false}, lost_{false};
-  std::mutex srcMutex_;
-  ComPtr<IUnknown> source_;
+  void OnSample(HRESULT hr, DWORD flags, IMFSample* s);
+  std::atomic<bool> open_{false}, stop_{false}, lost_{false};
+  ComPtr<IMFMediaSource> src_;
+  ComPtr<IMFSourceReader> reader_;
+  ReaderCallback* cb_ = nullptr;
+  struct ConverterState;
+  std::unique_ptr<ConverterState> conv_;
+  std::vector<float> out_;
 };

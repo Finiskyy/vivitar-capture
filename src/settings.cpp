@@ -8,10 +8,6 @@ static std::wstring GetS(const wchar_t* k, const std::wstring& def) {
   GetPrivateProfileStringW(L"app", k, def.c_str(), buf, 2048, IniPath().c_str());
   return buf;
 }
-static void PutI(const wchar_t* k, int v) {
-  WritePrivateProfileStringW(L"app", k, std::to_wstring(v).c_str(), IniPath().c_str());
-}
-static void PutS(const wchar_t* k, const std::wstring& v) { WritePrivateProfileStringW(L"app", k, v.c_str(), IniPath().c_str()); }
 
 void Settings::Load() {
   videoId = GetS(L"videoId", L"");
@@ -38,34 +34,51 @@ void Settings::Load() {
   enhRecord = GetI(L"enhRecord", 1) != 0;
   outRes = GetI(L"outRes", 0);
   bitrate = GetI(L"bitrate", 20);
+  frameGen = GetI(L"frameGen", 0) != 0;
+  upscaler = GetI(L"upscaler", 0);
   saveDir = GetS(L"saveDir", DefaultSaveDir());
   if (bri < -50 || bri > 50) bri = 0;
 }
 
 void Settings::Save() const {
-  PutS(L"videoId", videoId);
-  PutS(L"audioId", audioId);
-  PutI(L"audioAuto", audioAuto);
-  PutI(L"width", width);
-  PutI(L"height", height);
-  PutI(L"fps", fps);
-  PutI(L"fmtPref", fmtPref);
-  PutI(L"range", range);
-  PutI(L"monitor", monitor);
-  PutI(L"volume", volume);
-  PutI(L"muted", muted);
-  PutI(L"fit", fit);
-  PutI(L"sidebar", sidebar);
-  PutI(L"enh", enh);
-  PutI(L"preset", preset);
-  PutI(L"scaler", scaler);
-  PutI(L"sharpen", sharpen);
-  PutI(L"denoise", denoise);
-  PutI(L"bri", bri + 100);
-  PutI(L"con", con);
-  PutI(L"sat", sat);
-  PutI(L"enhRecord", enhRecord);
-  PutI(L"outRes", outRes);
-  PutI(L"bitrate", bitrate);
-  PutS(L"saveDir", saveDir);
+  // Build the whole file and write it once (WritePrivateProfileString per key is slow and caused hitches).
+  std::wstring t = L"[app]\r\n";
+  auto i = [&](const wchar_t* k, int v) { t += std::wstring(k) + L"=" + std::to_wstring(v) + L"\r\n"; };
+  auto str = [&](const wchar_t* k, const std::wstring& v) { t += std::wstring(k) + L"=" + v + L"\r\n"; };
+  str(L"videoId", videoId);
+  str(L"audioId", audioId);
+  i(L"audioAuto", audioAuto);
+  i(L"width", width);
+  i(L"height", height);
+  i(L"fps", fps);
+  i(L"fmtPref", fmtPref);
+  i(L"range", range);
+  i(L"monitor", monitor);
+  i(L"volume", volume);
+  i(L"muted", muted);
+  i(L"fit", fit);
+  i(L"sidebar", sidebar);
+  i(L"enh", enh);
+  i(L"preset", preset);
+  i(L"scaler", scaler);
+  i(L"sharpen", sharpen);
+  i(L"denoise", denoise);
+  i(L"bri", bri + 100);
+  i(L"con", con);
+  i(L"sat", sat);
+  i(L"enhRecord", enhRecord);
+  i(L"outRes", outRes);
+  i(L"bitrate", bitrate);
+  i(L"frameGen", frameGen);
+  i(L"upscaler", upscaler);
+  str(L"saveDir", saveDir);
+  std::wstring path = IniPath(), tmp = path + L".tmp";
+  HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return;
+  const wchar_t bom = 0xFEFF;  // UTF-16LE so device names/paths with any characters survive
+  DWORD wr = 0;
+  WriteFile(h, &bom, 2, &wr, nullptr);
+  WriteFile(h, t.data(), DWORD(t.size() * sizeof(wchar_t)), &wr, nullptr);
+  CloseHandle(h);
+  MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
 }
