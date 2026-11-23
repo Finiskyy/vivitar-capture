@@ -121,12 +121,14 @@ void Recorder::Run(std::promise<std::string>* prom) {
   ComPtr<IMFSinkWriter> w;
   DWORD vs = 0, as = 0;
   HRESULT hr = S_OK;
-  std::string err = [&]() -> std::string {
+  auto setup = [&](bool fragmented) -> std::string {
+    w.Reset();
     ComPtr<IMFAttributes> a;
     MFCreateAttributes(&a, 4);
     a->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
     a->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
-    a->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
+    // Fragmented MP4 writes self-contained chunks as it goes, so the file plays even if finalising fails.
+    a->SetGUID(MF_TRANSCODE_CONTAINERTYPE, fragmented ? MFTranscodeContainerType_FMPEG4 : MFTranscodeContainerType_MPEG4);
     hr = MFCreateSinkWriterFromURL(cfg.path.c_str(), nullptr, a.Get(), &w);
     if (FAILED(hr)) return "Couldn't create the video file (" + HrStr(hr) + ").";
 
@@ -203,10 +205,19 @@ void Recorder::Run(std::promise<std::string>* prom) {
       }
     }
     if (encoderName.empty()) encoderName = "H.264";
+    container = fragmented ? "fragmented MP4" : "MP4";
+    Log("Recording (%s) %ls", container.c_str(), cfg.path.c_str());
     Log("Recording %ls: %ux%u %u/%u fps %u Mbps, encoder: %s", cfg.path.c_str(), cfg.w, cfg.h, cfg.fpsN, cfg.fpsD,
         cfg.mbps, encoderName.c_str());
     return {};
-  }();
+  };
+  std::string err = setup(true);
+  if (!err.empty()) {
+    Log("Fragmented MP4 unavailable (%s), using regular MP4", err.c_str());
+    w.Reset();
+    DeleteFileW(cfg.path.c_str());
+    err = setup(false);
+  }
   prom->set_value(err);
   if (!err.empty()) {
     Log("Recorder start failed: %s", err.c_str());
@@ -216,6 +227,9 @@ void Recorder::Run(std::promise<std::string>* prom) {
 
   const int64_t frameDur = int64_t(10000000.0 * cfg.fpsD / std::max<UINT32>(1, cfg.fpsN));
   int64_t lastVideo = -1;
+  uint64_t nVideo = 0, nAudio = 0, nFail = 0;
+  int64_t firstV = -1, firstA = -1, lastA = -1;
+  HRESULT firstErr = S_OK;
   for (;;) {
     Item it;
     {
@@ -231,15 +245,37 @@ void Recorder::Run(std::promise<std::string>* prom) {
       if (t <= lastVideo) t = lastVideo + 1;
       lastVideo = t;
       hr = AddSample(w.Get(), vs, it.data, t, frameDur);
+      if (SUCCEEDED(hr)) {
+        if (firstV < 0) firstV = t;
+        nVideo++;
+      }
       std::lock_guard<std::mutex> lk(m_);
       if (pool_.size() < 4) pool_.push_back(std::move(it.data));
     } else {
       hr = AddSample(w.Get(), as, it.data, it.t, int64_t(it.data.size() / 4) * 10000000LL / 48000);
+      if (SUCCEEDED(hr)) {
+        if (firstA < 0) firstA = it.t;
+        lastA = it.t;
+        nAudio++;
+      }
     }
-    if (FAILED(hr)) Log("WriteSample failed: %s", HrStr(hr).c_str());
+    if (FAILED(hr)) {
+      if (nFail < 5) Log("WriteSample (%s) failed: %s", it.video ? "video" : "audio", HrStr(hr).c_str());
+      if (SUCCEEDED(firstErr)) firstErr = hr;
+      nFail++;
+    }
   }
+  Log("Recording stopping: %llu video frames (first at %.3fs, last at %.3fs), %llu audio chunks (%.3fs..%.3fs), %llu "
+      "write failures, %u dropped",
+      nVideo, firstV / 1e7, lastVideo / 1e7, nAudio, firstA / 1e7, lastA / 1e7, nFail, dropped.load());
+  if (cfg.audio && nAudio == 0 && nVideo > 0) Log("Note: audio track was set up but no audio arrived");
+  int64_t f0 = Now100ns();
   hr = w->Finalize();
-  Log("Recording finalised: %s, dropped %u frames", HrStr(hr).c_str(), dropped.load());
+  Log("Finalize: %s (%.0f ms)", HrStr(hr).c_str(), (Now100ns() - f0) / 10000.0);
+  if (nVideo == 0) result = "No video frames reached the encoder.";
+  else if (FAILED(firstErr)) result = "The encoder rejected the video (" + HrStr(firstErr) + ").";
+  else if (FAILED(hr) && container != "fragmented MP4") result = "Couldn't finish the file (" + HrStr(hr) + ").";
+  else result.clear();
   w.Reset();
   CoUninitialize();
 }

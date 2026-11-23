@@ -263,7 +263,7 @@ class App {
     std::lock_guard<std::mutex> lk(recM);
     return rec;
   }
-  std::vector<std::thread> finalizers;  // recordings being finalised in the background
+  std::atomic<int> pendingSaves{0};  // recordings being finalised in the background
   std::string lastEncoder;
   Renderer R;
   std::vector<DeviceInfo> vids, auds;
@@ -337,8 +337,8 @@ void App::Init() {
 
 void App::Shutdown() {
   if (recording) StopRecording();
-  for (auto& t : finalizers)
-    if (t.joinable()) t.join();
+  // Give background saves up to 20 s to finish before exiting.
+  for (int i = 0; i < 200 && pendingSaves > 0; i++) Sleep(100);
   if (opening.valid()) FinishOpen(opening.get());
   cap->Close();
   acap->Close();
@@ -773,7 +773,8 @@ void App::StopRecording() {
   if (!r) return;
   ToastMsg("Saving recording...");
   // Finalising the MP4 waits for the encoder to drain, so never do it on the UI thread.
-  finalizers.emplace_back([this, r] {
+  pendingSaves++;
+  std::thread([this, r] {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     int64_t t0 = Now100ns();
     std::wstring path = r->cfg.path;
@@ -781,10 +782,14 @@ void App::StopRecording() {
     Log("Recording stop took %.0f ms", (Now100ns() - t0) / 10000.0);
     uint32_t dropped = r->dropped.load();
     std::wstring name = path.substr(path.find_last_of(L'\\') + 1);
-    ToastMsg("Saved \"" + W2U(name) + "\"" + (dropped ? "  (" + std::to_string(dropped) + " frames dropped)" : ""), cOk, 5);
+    if (!r->result.empty())
+      ToastMsg("Recording failed: " + r->result + " Please send the log file (Settings > Signal > Open log).", cRec, 12);
+    else
+      ToastMsg("Saved \"" + W2U(name) + "\"" + (dropped ? "  (" + std::to_string(dropped) + " frames dropped)" : ""), cOk, 5);
+    pendingSaves--;
     libDirty = true;
     CoUninitialize();
-  });
+  }).detach();
 }
 
 void App::Screenshot() {
@@ -1485,6 +1490,13 @@ void App::Sidebar() {
   row("Encoder", lastEncoder.empty() ? "H.264 / AAC (MP4)" : lastEncoder);
   row("AMD AMF", fx.Ready() ? fx.version : "Not available");
   row("Display", std::to_string(displayHz) + " Hz");
+  ImGui::Dummy(ImVec2(0, 4 * s));
+  float lw = (ImGui::GetContentRegionAvail().x - 8 * s) / 2;
+  if (ImGui::Button("Open log", ImVec2(lw, 0)))
+    ShellExecuteW(nullptr, L"open", (AppDataDir() + L"\\log.txt").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  ImGui::SameLine(0, 8 * s);
+  if (ImGui::Button("Log folder", ImVec2(lw, 0)))
+    ShellExecuteW(nullptr, L"open", AppDataDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
   Divider(s);
 
   Section("SHORTCUTS");
@@ -1596,7 +1608,7 @@ void App::BottomBar(float h) {
   float tx = rx + 30 * s + 22 * s;
   dl->AddText(ImVec2(tx, cy - 18 * s), recording ? Col(cText) : Col(cMuted), tm.c_str());
   ImGui::PopFont();
-  std::string sub = "Ready";
+  std::string sub = pendingSaves > 0 ? "Saving..." : "Ready";
   if (recording) {
     if (rec) {
       sub = FmtSize(recBytes) + (recEnh ? "  Enhanced" : "") + "  " + std::to_string(rec->cfg.h) + "p" +

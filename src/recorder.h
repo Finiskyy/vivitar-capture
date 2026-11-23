@@ -24,6 +24,8 @@ class Recorder {
   uint64_t Bytes() const;
   std::atomic<uint32_t> dropped{0};
   std::string encoderName;
+  std::string container;  // "fragmented MP4" or "MP4"
+  std::string result;     // after Stop(): empty on success, otherwise what went wrong
   RecordConfig cfg;
 
  private:
