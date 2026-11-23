@@ -18,6 +18,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Compile shaders (validation)
+        shell: pwsh
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter fxc.exe |
+                 Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw "fxc.exe not found" }
+          $src = Get-Content src/renderer.cpp -Raw
+          $m = [regex]::Match($src, 'R"HLSL\((.*?)\)HLSL"', 'Singleline')
+          Set-Content -Path shaders.hlsl -Value $m.Groups[1].Value
+          $entries = @(@('VSMain','vs_5_0'),@('PSConvert','ps_5_0'),@('PSMain','ps_5_0'),@('PSToY','ps_5_0'),@('PSToUV','ps_5_0'),
+                       @('PSDown','ps_5_0'),@('PSMotion','ps_5_0'),@('PSTemporal','ps_5_0'),@('PSCopy','ps_5_0'))
+          $failed = $false
+          foreach ($e in $entries) {
+            & $fxc.FullName /nologo /O3 /E $e[0] /T $e[1] /Fo NUL shaders.hlsl
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::Shader $($e[0]) failed to compile"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+
       - name: Configure
         run: cmake -S . -B build -A x64
 

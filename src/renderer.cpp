@@ -235,7 +235,17 @@ bool Renderer::Init(ID3D11Device* dev, ID3D11DeviceContext* ctx, std::string& er
   } list[] = {{"PSConvert", &psConvert_}, {"PSMain", &psMain_}, {"PSToY", &psY_},         {"PSToUV", &psUV_},
               {"PSDown", &psDown_},       {"PSMotion", &psMotion_}, {"PSTemporal", &psTemporal_}, {"PSCopy", &psCopy_}};
   for (auto& l : list) {
-    if (FAILED(Compile(l.e, "ps_5_0", b, err))) return false;
+    std::string e2;
+    if (FAILED(Compile(l.e, "ps_5_0", b, e2))) {
+      // The motion/temporal shaders are optional extras; the core ones are required.
+      bool optional = !strcmp(l.e, "PSDown") || !strcmp(l.e, "PSMotion") || !strcmp(l.e, "PSTemporal") || !strcmp(l.e, "PSCopy");
+      if (!optional) {
+        err = e2;
+        return false;
+      }
+      motionOk_ = false;
+      continue;
+    }
     dev_->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, l.ps->GetAddressOf());
   }
   D3D11_BUFFER_DESC bd{};
@@ -454,7 +464,7 @@ void Renderer::Draw(RenderTarget& t, int fit, const EnhanceParams& e, const Colo
 }
 
 void Renderer::Motion() {
-  if (!HasFrame() || !texY_) return;
+  if (!HasFrame() || !texY_ || !motionOk_) return;
   std::swap(cur_, prev_);
   UINT lw[4], lh[4];
   bool sizeChanged = false;
@@ -498,7 +508,7 @@ void Renderer::Motion() {
 }
 
 void Renderer::Temporal(float strength) {
-  if (!HasFrame() || strength <= 0) {
+  if (!HasFrame() || strength <= 0 || !motionOk_) {
     temporalOut_ = false;
     haveHist_ = false;
     return;

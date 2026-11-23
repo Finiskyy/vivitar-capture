@@ -90,7 +90,7 @@ class Renderer {
   RenderTarget pyrA_[4], pyrB_[4], mv_[4];
   RenderTarget* cur_ = pyrA_;
   RenderTarget* prev_ = pyrB_;
-  bool havePrevPyr_ = false, haveMotion_ = false;
+  bool havePrevPyr_ = false, haveMotion_ = false, motionOk_ = true;
   RenderTarget hist_[2], rgbT_;
   int histIdx_ = 0;
   bool haveHist_ = false, temporalOut_ = false;
