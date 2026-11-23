@@ -60,6 +60,8 @@ class Renderer {
   // Motion-compensated temporal noise reduction of the converted frame; strength 0 turns it off.
   void Temporal(float strength);
   bool showMotion = false;  // debug overlay in Draw()
+  // Renders per-pixel motion vectors (R16G16_FLOAT, pixel units) into rtv, for FSR. Zero if no motion yet.
+  void DrawMotionFull(ID3D11RenderTargetView* rtv, UINT w, UINT h);
   // Copies `src` into `dst`, (re)creating dst with the same size and format (render target + shader resource).
   bool CopyToOwned(ID3D11Texture2D* src, RenderTarget& dst);
 
@@ -79,7 +81,7 @@ class Renderer {
   ID3D11Device* dev_ = nullptr;
   ID3D11DeviceContext* ctx_ = nullptr;
   ComPtr<ID3D11VertexShader> vs_;
-  ComPtr<ID3D11PixelShader> psConvert_, psMain_, psY_, psUV_, psDown_, psMotion_, psTemporal_, psCopy_;
+  ComPtr<ID3D11PixelShader> psConvert_, psMain_, psY_, psUV_, psDown_, psMotion_, psTemporal_, psCopy_, psMVUp_;
   ComPtr<ID3D11Buffer> cb_;
   ComPtr<ID3D11SamplerState> samp_;
   ComPtr<ID3D11Texture2D> texY_, texUV_;

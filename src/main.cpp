@@ -3,6 +3,7 @@
 #include "audio_out.h"
 #include "capture.h"
 #include "common.h"
+#include "fsr.h"
 #include "recorder.h"
 #include "renderer.h"
 #include "settings.h"
@@ -282,7 +283,16 @@ class App {
   struct FgFrame {
     RenderTarget rt;
     int64_t t = 0;
+    uint64_t serial = 0;
   };
+  // FSR (Direct3D 12 via the FidelityFX SDK)
+  FsrUpscaler fsr;
+  uint64_t serialCounter = 0, procSerial = 0;  // identifies each new picture fed to the temporal upscaler
+  struct FsrLast {
+    uint64_t serial = 0;
+    UINT w = 0, h = 0;
+    ID3D11ShaderResourceView* srv = nullptr;
+  } fsrLast[2];
   std::deque<FgFrame> fgQueue;
   std::vector<RenderTarget> fgPool;
   RenderTarget fgIn[4], upRT[2];
@@ -291,16 +301,17 @@ class App {
   int64_t lastUniqueT = 0, fgPeriod = 0;
   bool FgActive() const { return S.frameGen && fx.Ready() && !fgFailed && cap->IsOpen(); }
   void ProcessFG(int64_t t, bool rec);
-  void RecordFrame(const SrcOverride* ov, int64_t t);
+  void RecordFrame(const SrcOverride* ov, int64_t t, uint64_t serial, float mvScale);
   void DrawUp(RenderTarget& t, int fit, const EnhanceParams& e, const ColorParams& c, float split, float lineW,
-              const SrcOverride* ov, int slot, bool allowAmd);
+              const SrcOverride* ov, int slot, bool allowAmd, uint64_t serial, float mvScale);
   void DetectRefresh();
   bool showMV = false;
   // Motion estimation + temporal noise reduction for each new frame.
   void PostProcess() {
     bool tnr = S.enh && S.tnr > 0;
     R.showMotion = showMV;
-    if (tnr || showMV) R.Motion();
+    if (tnr || showMV || (S.enh && S.upscaler >= 3)) R.Motion();
+    procSerial = ++serialCounter;
     R.Temporal(tnr ? S.tnr / 100.f * 0.85f : 0.f);
   }
   int wantPW = 0, wantPH = 0;
@@ -340,6 +351,8 @@ void App::Init() {
   UpdateMonitorVolume();
   mon.Start();
   fx.Init(g_dev.Get(), g_vendorId);
+  fsr.Init(g_dev.Get(), g_ctx.Get());
+  Log("FSR: %s", fsr.status.c_str());
   DetectRefresh();
   Scan();
   OpenDevice();
@@ -570,7 +583,7 @@ void App::Tick() {
         R.Convert(color, enh.denoise);
         PostProcess();
         if (fg) ProcessFG(f.t, gpuRec);
-        else RecordFrame(nullptr, f.t);
+        else RecordFrame(nullptr, f.t, procSerial, 1.f);
       }
       converted = true;
     } else {
@@ -628,6 +641,8 @@ void App::RenderPreview() {
   // With frame generation, show the newest generated frame that is due.
   SrcOverride fgSrc;
   const SrcOverride* ov = nullptr;
+  uint64_t serial = procSerial;
+  float mvs = 1.f;
   if (FgActive() && !fgQueue.empty()) {
     int64_t now = Now100ns();
     while (fgQueue.size() > 1 && fgQueue[1].t <= now) {
@@ -637,13 +652,44 @@ void App::RenderPreview() {
     auto& f = fgQueue.front();
     fgSrc = {f.rt.srv.Get(), f.rt.tex.Get(), f.rt.w, f.rt.h};
     ov = &fgSrc;
+    serial = f.serial;
+    mvs = 0.5f;  // consecutive generated frames are half a real frame apart
   }
-  DrawUp(preview, S.fit, Enh(), Color(), split, std::max(1.f, s), ov, 0, true);
+  DrawUp(preview, S.fit, Enh(), Color(), split, std::max(1.f, s), ov, 0, true, serial, mvs);
 }
 
 void App::DrawUp(RenderTarget& t, int fit, const EnhanceParams& e, const ColorParams& c, float split, float lineW,
-                 const SrcOverride* ov, int slot, bool allowAmd) {
-  if (allowAmd && S.enh && S.upscaler > 0 && fx.Ready() && !fx.ScaleFailed() && R.HasFrame()) {
+                 const SrcOverride* ov, int slot, bool allowAmd, uint64_t serial, float mvScale) {
+  // FSR 3 / 4: temporal, so it runs once per new picture and the result is reused until the next one.
+  if (allowAmd && S.enh && S.upscaler >= 3 && fsr.Ready() && R.HasFrame()) {
+    int major = S.upscaler == 4 ? 4 : 3;
+    SrcOverride base = ov ? *ov : R.Rgb();
+    float x, y, w, h;
+    R.FitRect(t.w, t.h, fit, x, y, w, h);
+    UINT ow = (UINT)w, oh = (UINT)h;
+    if (base.tex && !fsr.Failed(major) && ow >= base.w && oh >= base.h && ow <= base.w * 3 && oh <= base.h * 3) {
+      FsrLast& L = fsrLast[slot];
+      if (L.serial != serial || L.w != ow || L.h != oh || !L.srv) {
+        bool reset = !L.srv || serial > L.serial + 2;
+        L.srv = fsr.Upscale(
+            slot, major, base.tex, base.w, base.h,
+            [this](ID3D11RenderTargetView* rtv, UINT mw, UINT mh) { R.DrawMotionFull(rtv, mw, mh); }, ow, oh, mvScale,
+            e.sharpen, reset);
+        L.serial = serial;
+        L.w = ow;
+        L.h = oh;
+      }
+      if (L.srv) {
+        SrcOverride o{L.srv, nullptr, ow, oh};
+        EnhanceParams e2 = e;
+        e2.scaler = 0;
+        e2.sharpen = 0;  // FSR's own sharpening (RCAS) already used the slider
+        R.Draw(t, fit, e2, c, split, lineW, &o);
+        return;
+      }
+    }
+  }
+  if (allowAmd && S.enh && (S.upscaler == 1 || S.upscaler == 2) && fx.Ready() && !fx.ScaleFailed() && R.HasFrame()) {
     SrcOverride base = ov ? *ov : R.Rgb();
     float x, y, w, h;
     R.FitRect(t.w, t.h, fit, x, y, w, h);
@@ -696,12 +742,13 @@ void App::ProcessFG(int64_t t, bool rec) {
       fgPool.pop_back();
     }
     if (!R.CopyToOwned(outs[i], f.rt)) continue;
+    f.serial = ++serialCounter;
     // Interpolated frame shows at arrival time, the real frame half a frame later.
     f.t = (n == 2 && i == 1) ? t + period / 2 : t;
     fgOutCount++;
     if (rec) {
       SrcOverride o{f.rt.srv.Get(), f.rt.tex.Get(), f.rt.w, f.rt.h};
-      RecordFrame(&o, f.t);
+      RecordFrame(&o, f.t, f.serial, 0.5f);
     }
     fgQueue.push_back(std::move(f));
   }
@@ -711,11 +758,11 @@ void App::ProcessFG(int64_t t, bool rec) {
   }
 }
 
-void App::RecordFrame(const SrcOverride* ov, int64_t t) {
+void App::RecordFrame(const SrcOverride* ov, int64_t t, uint64_t serial, float mvScale) {
   UINT rw = R.srcW, rh = R.srcH;
   if (recEnh) OutSize(rw, rh);
   R.Ensure(recRT, rw, rh, DXGI_FORMAT_R8G8B8A8_UNORM);
-  DrawUp(recRT, FitContain, recEnh ? Enh() : EnhanceParams{}, Color(), -1.f, 1.f, ov, 1, recEnh);
+  DrawUp(recRT, FitContain, recEnh ? Enh() : EnhanceParams{}, Color(), -1.f, 1.f, ov, 1, recEnh, serial, mvScale);
   if (recAmf) {
     if (!fx.EncSubmit(recRT.tex.Get(), t, recFrameDur)) Log("AMF encode submit failed");
     return;
@@ -848,7 +895,7 @@ void App::Screenshot() {
   UINT w = R.srcW, h = R.srcH;
   if (e) OutSize(w, h);
   R.Ensure(shotRT, w, h, DXGI_FORMAT_R8G8B8A8_UNORM);
-  DrawUp(shotRT, FitContain, e ? Enh() : EnhanceParams{}, Color(), -1.f, 1.f, nullptr, 1, e);
+  DrawUp(shotRT, FitContain, e ? Enh() : EnhanceParams{}, Color(), -1.f, 1.f, nullptr, 1, e, procSerial, 1.f);
   std::vector<uint8_t> px;
   if (!R.ReadRGBA(shotRT, px)) {
     ToastMsg("Screenshot failed", cRec);
@@ -1411,14 +1458,31 @@ void App::Sidebar() {
   if (Seg("scaler", &S.scaler, {"Standard", "Bicubic", "Lanczos"})) S.preset = 4, Dirty();
   ImGui::TextColored(V4(cMuted), "AMD upscaler");
   {
-    const char* ups[] = {"Off (use the upscaler above)", "AMD VideoSR (FSR-based)", "AMD VideoSR 1.1 (experimental)"};
-    ImGui::BeginDisabled(!fx.Ready());
+    std::string f3 = fsr.HasMajor(3) ? "AMD FSR 3 (temporal)" : "AMD FSR 3 (not available)";
+    std::string f4 = fsr.HasMajor(4) ? "AMD FSR 4 (AI, temporal)" : "AMD FSR 4 (not available)";
+    const char* ups[] = {"Off (use the upscaler above)", "AMD VideoSR (FSR-based)", "AMD VideoSR 1.1 (experimental)",
+                         f3.c_str(), f4.c_str()};
     ImGui::SetNextItemWidth(-1);
-    if (ImGui::Combo("##amdup", &S.upscaler, ups, 3)) Dirty();
-    ImGui::EndDisabled();
-    if (!fx.Ready()) Muted(fx.status.c_str());
-    else if (S.upscaler > 0 && fx.ScaleFailed()) Muted("Your driver doesn't support AMD VideoSR, so the upscaler above is used.");
-    else if (S.upscaler > 0) Muted("Used when the picture is being enlarged. The Sharpen slider controls VideoSR's sharpness.");
+    if (ImGui::Combo("##amdup", &S.upscaler, ups, 5)) {
+      fsrLast[0] = fsrLast[1] = FsrLast{};
+      Dirty();
+    }
+    if (S.upscaler == 1 || S.upscaler == 2) {
+      if (!fx.Ready()) Muted(fx.status.c_str());
+      else if (fx.ScaleFailed()) Muted("Your driver doesn't support AMD VideoSR, so the upscaler above is used.");
+      else Muted("Used when the picture is being enlarged. The Sharpen slider controls VideoSR's sharpness.");
+    } else if (S.upscaler >= 3) {
+      int major = S.upscaler == 4 ? 4 : 3;
+      if (!fsr.Ready()) Muted(fsr.status.c_str());
+      else if (!fsr.HasMajor(major)) Muted("This FSR version isn't available with your driver and the bundled SDK.");
+      else if (fsr.Failed(major)) Muted("FSR failed to start. The log has the details; the upscaler above is used instead.");
+      else {
+        std::string n = fsr.ActiveName(0);
+        if (!n.empty()) ImGui::TextColored(V4(cOk), "Running: %s", n.c_str());
+        Muted("Uses the app's own motion vectors. Video has no camera jitter, so FSR acts mostly as temporal "
+              "anti-aliasing and clean-up while it upscales. Also works at 1:1 (no upscaling).");
+      }
+    }
   }
   if (LabeledSlider("##sh", "Sharpen", &S.sharpen, 0, 100, "%d")) S.preset = 4, Dirty();
   if (LabeledSlider("##dn", "Noise & block reduction", &S.denoise, 0, 100, "%d")) S.preset = 4, Dirty();

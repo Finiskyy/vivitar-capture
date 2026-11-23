@@ -28,7 +28,7 @@ jobs:
           $m = [regex]::Match($src, 'R"HLSL\((.*?)\)HLSL"', 'Singleline')
           Set-Content -Path shaders.hlsl -Value $m.Groups[1].Value
           $entries = @(@('VSMain','vs_5_0'),@('PSConvert','ps_5_0'),@('PSMain','ps_5_0'),@('PSToY','ps_5_0'),@('PSToUV','ps_5_0'),
-                       @('PSDown','ps_5_0'),@('PSMotion','ps_5_0'),@('PSTemporal','ps_5_0'),@('PSCopy','ps_5_0'))
+                       @('PSDown','ps_5_0'),@('PSMotion','ps_5_0'),@('PSTemporal','ps_5_0'),@('PSCopy','ps_5_0'),@('PSMVUp','ps_5_0'))
           $failed = $false
           foreach ($e in $entries) {
             & $fxc.FullName /nologo /O3 /E $e[0] /T $e[1] /Fo NUL shaders.hlsl
@@ -42,11 +42,36 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      - name: Fetch AMD FidelityFX SDK signed DLLs (FSR 3 / FSR 4)
+        shell: bash
+        env:
+          FFX_SHA: 7539ae8b6568ad29ed78a753404351daf3b5cca7  # AMD FSR SDK 2.4.0
+        run: |
+          base="https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/raw/${FFX_SHA}/Kits/FidelityFX/signedbin"
+          for f in amd_fidelityfx_loader_dx12.dll amd_fidelityfx_upscaler_dx12.dll; do
+            curl -fsSL -o "build/Release/$f" "$base/$f"
+            size=$(stat -c %s "build/Release/$f")
+            echo "$f: $size bytes"
+            if [ "$size" -lt 20000 ]; then echo "::error::$f looks wrong ($size bytes)"; exit 1; fi
+          done
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/Release/VivitarCapture.exe dist/
+          Copy-Item build/Release/amd_fidelityfx_loader_dx12.dll dist/
+          Copy-Item build/Release/amd_fidelityfx_upscaler_dx12.dll dist/
+          Copy-Item third_party/ffx/LICENSE.md dist/LICENSE-AMD-FidelityFX.md
+          Copy-Item third_party/amf/LICENSE.txt dist/LICENSE-AMD-AMF.txt
+          Compress-Archive -Path dist/* -DestinationPath VivitarCapture.zip -Force
+          Get-Item VivitarCapture.zip | Select-Object Name, Length
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: VivitarCapture
-          path: build/Release/VivitarCapture.exe
+          path: dist/*
 
       - name: Publish "latest" release
         shell: bash
@@ -54,7 +79,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest build/Release/VivitarCapture.exe \
+          gh release create latest VivitarCapture.zip build/Release/VivitarCapture.exe \
             --title "Latest build" \
-            --notes "Automatic build of ${GITHUB_SHA::7}. Download VivitarCapture.exe below and run it." \
+            --notes "Automatic build of ${GITHUB_SHA::7}. Download **VivitarCapture.zip**, extract it, and run VivitarCapture.exe (the DLLs next to it enable AMD FSR 3/4). VivitarCapture.exe alone works without FSR." \
             --target "$GITHUB_SHA"

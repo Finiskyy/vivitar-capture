@@ -192,6 +192,11 @@ float4 PSTemporal(V i) : SV_Target {
   float w = A.z * exp(-dot(d, d) * 30.0);          // trust history less where it disagrees (bad match)
   return float4(lerp(c, hc, w), 1);
 }
+// Per-pixel motion vectors for FSR (pixel units, pointing to the previous frame). A = W, H, valid
+float2 PSMVUp(V i) : SV_Target {
+  if (A.z < 0.5) return float2(0, 0);
+  return TMV.SampleLevel(SL, i.pos.xy / A.xy, 0);
+}
 float4 PSCopy(V i) : SV_Target { return float4(THist.Load(int3(int2(i.pos.xy), 0)).rgb, 1); }
 
 // ---- RGB -> NV12 (BT.709 limited range) for the encoder.
@@ -233,12 +238,14 @@ bool Renderer::Init(ID3D11Device* dev, ID3D11DeviceContext* ctx, std::string& er
     const char* e;
     ComPtr<ID3D11PixelShader>* ps;
   } list[] = {{"PSConvert", &psConvert_}, {"PSMain", &psMain_}, {"PSToY", &psY_},         {"PSToUV", &psUV_},
-              {"PSDown", &psDown_},       {"PSMotion", &psMotion_}, {"PSTemporal", &psTemporal_}, {"PSCopy", &psCopy_}};
+              {"PSDown", &psDown_},       {"PSMotion", &psMotion_}, {"PSTemporal", &psTemporal_}, {"PSCopy", &psCopy_},
+              {"PSMVUp", &psMVUp_}};
   for (auto& l : list) {
     std::string e2;
     if (FAILED(Compile(l.e, "ps_5_0", b, e2))) {
       // The motion/temporal shaders are optional extras; the core ones are required.
-      bool optional = !strcmp(l.e, "PSDown") || !strcmp(l.e, "PSMotion") || !strcmp(l.e, "PSTemporal") || !strcmp(l.e, "PSCopy");
+      bool optional = !strcmp(l.e, "PSDown") || !strcmp(l.e, "PSMotion") || !strcmp(l.e, "PSTemporal") ||
+                      !strcmp(l.e, "PSCopy") || !strcmp(l.e, "PSMVUp");
       if (!optional) {
         err = e2;
         return false;
@@ -627,4 +634,18 @@ bool Renderer::ReadRGBA(RenderTarget& src, std::vector<uint8_t>& out) {
     memcpy(out.data() + size_t(r) * src.w * 4, (uint8_t*)m.pData + size_t(r) * m.RowPitch, size_t(src.w) * 4);
   ctx_->Unmap(rgbaStaging_.Get(), 0);
   return true;
+}
+
+void Renderer::DrawMotionFull(ID3D11RenderTargetView* rtv, UINT w, UINT h) {
+  if (!rtv) return;
+  if (!psMVUp_ || !haveMotion_ || !mv_[0].srv) {
+    float z[4] = {0, 0, 0, 0};
+    ctx_->ClearRenderTargetView(rtv, z);
+    return;
+  }
+  CBData cb{};
+  cb.A[0] = float(w);
+  cb.A[1] = float(h);
+  cb.A[2] = 1.f;
+  Pass(rtv, 0, 0, float(w), float(h), psMVUp_.Get(), &cb, sizeof(cb), {nullptr, nullptr, nullptr, mv_[0].srv.Get()});
 }

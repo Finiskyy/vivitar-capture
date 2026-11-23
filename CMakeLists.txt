@@ -33,6 +33,7 @@ add_executable(VivitarCapture WIN32
   src/settings.cpp
   src/util.cpp
   src/amd_fx.cpp
+  src/fsr.cpp
   res/app.rc
   res/app.manifest)
 
@@ -44,6 +45,6 @@ if(MSVC)
 endif()
 
 target_link_libraries(VivitarCapture PRIVATE
-  imgui d3d11 dxgi d3dcompiler dwmapi
+  imgui d3d11 d3d12 dxgi d3dcompiler dwmapi
   mfplat mfreadwrite mf mfuuid
   ole32 oleaut32 uuid windowscodecs shell32 shlwapi)
