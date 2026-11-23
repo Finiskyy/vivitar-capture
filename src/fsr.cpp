@@ -57,37 +57,39 @@ struct FsrUpscaler::Impl {
     std::string name;
   } slots[2];
 
+  // Shared textures are created on the Direct3D 11 side (NT handle) and opened in Direct3D 12.
   bool MakeShared(Shared& s, UINT w, UINT h, DXGI_FORMAT f, bool uav) {
     if (s.r12 && s.w == w && s.h == h) return true;
     s = Shared{};
-    D3D12_HEAP_PROPERTIES hp{};
-    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC rd{};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    rd.Width = w;
-    rd.Height = h;
-    rd.DepthOrArraySize = 1;
-    rd.MipLevels = 1;
-    rd.Format = f;
-    rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
-    HRESULT hr = dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                IID_PPV_ARGS(&s.r12));
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = w;
+    d.Height = h;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = f;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | (uav ? D3D11_BIND_UNORDERED_ACCESS : 0);
+    d.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+    HRESULT hr = dev11->CreateTexture2D(&d, nullptr, &s.t11);
     if (FAILED(hr)) {
-      Log("FSR: CreateCommittedResource %ux%u fmt %d failed: %s", w, h, (int)f, HrStr(hr).c_str());
+      Log("FSR: shared CreateTexture2D %ux%u fmt %d failed: %s", w, h, (int)f, HrStr(hr).c_str());
       return false;
     }
+    ComPtr<IDXGIResource1> dr;
     HANDLE hnd = nullptr;
-    hr = dev12->CreateSharedHandle(s.r12.Get(), nullptr, GENERIC_ALL, nullptr, &hnd);
+    hr = s.t11.As(&dr);
+    if (SUCCEEDED(hr))
+      hr = dr->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr, &hnd);
     if (FAILED(hr)) {
-      Log("FSR: CreateSharedHandle failed: %s", HrStr(hr).c_str());
+      Log("FSR: CreateSharedHandle (D3D11) failed: %s", HrStr(hr).c_str());
       return false;
     }
-    hr = dev11->OpenSharedResource1(hnd, IID_PPV_ARGS(&s.t11));
+    hr = dev12->OpenSharedHandle(hnd, IID_PPV_ARGS(&s.r12));
     CloseHandle(hnd);
     if (FAILED(hr)) {
-      Log("FSR: OpenSharedResource1 failed: %s", HrStr(hr).c_str());
+      Log("FSR: OpenSharedHandle (D3D12) %ux%u fmt %d failed: %s", w, h, (int)f, HrStr(hr).c_str());
+      s = Shared{};
       return false;
     }
     dev11->CreateRenderTargetView(s.t11.Get(), nullptr, &s.rtv);
