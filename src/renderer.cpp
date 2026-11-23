@@ -39,7 +39,7 @@ float3 fetchRGB(int2 p) {
 float4 PSConvert(V i) : SV_Target {
   int2 p = int2(i.pos.xy);
   float3 col = fetchRGB(p);
-  if (A.w > 0) {
+  [branch] if (A.w > 0) {
     float sr = lerp(0.03, 0.17, A.w); float k = 1.0 / (2.0 * sr * sr);
     float3 sum = col; float ws = 1;
     [unroll] for (int n = 0; n < 12; n++) {
@@ -80,15 +80,18 @@ float3 catrom(float2 uv, float2 sz) {
 float4 PSMain(V i) : SV_Target {
   float2 uv = i.uv;
   float4 o;
-  if (C.w >= 0 && i.pos.x < C.w) {
+  [branch] if (C.w >= 0 && i.pos.x < C.w) {
     float y = TY.SampleLevel(SL, uv, 0); float2 ch = TUV.SampleLevel(SL, uv, 0);
     o = float4(yuv2rgb(y, ch, D.y, D.z, D.w, E.x), 1);
   } else {
     float2 sz = B.xy; int mode = int(B.z + 0.5);
-    float3 c = mode == 2 ? lanczos(uv, sz) : mode == 1 ? catrom(uv, sz) : TRGB.SampleLevel(SL, uv, 0).rgb;
+    float3 c;
+    [branch] if (mode == 2) c = lanczos(uv, sz);
+    else if (mode == 1) c = catrom(uv, sz);
+    else c = TRGB.SampleLevel(SL, uv, 0).rgb;
     c = saturate(c);
     float3 col = c;
-    if (B.w > 0) {
+    [branch] if (B.w > 0) {
       float2 t = 1.0 / sz;
       float3 n = TRGB.SampleLevel(SL, uv - float2(0, t.y), 0).rgb, s = TRGB.SampleLevel(SL, uv + float2(0, t.y), 0).rgb;
       float3 e = TRGB.SampleLevel(SL, uv + float2(t.x, 0), 0).rgb, w = TRGB.SampleLevel(SL, uv - float2(t.x, 0), 0).rgb;
