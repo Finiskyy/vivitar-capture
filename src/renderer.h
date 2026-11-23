@@ -49,8 +49,17 @@ class Renderer {
             const SrcOverride* ov = nullptr);
   // Where the picture lands inside a tw x th target for a fit mode (pixels).
   void FitRect(UINT tw, UINT th, int fit, float& x, float& y, float& w, float& h) const;
-  // The converted source-resolution RGB frame.
-  SrcOverride Rgb() { return {rgb_.srv.Get(), rgb_.tex.Get(), rgb_.w, rgb_.h}; }
+  // The processed source-resolution RGB frame (temporally denoised when that's on).
+  SrcOverride Rgb() {
+    RenderTarget& r = temporalOut_ ? rgbT_ : rgb_;
+    return {r.srv.Get(), r.tex.Get(), r.w, r.h};
+  }
+  // Estimates motion between the previous and the newest uploaded frame (call once per new frame).
+  void Motion();
+  bool HasMotion() const { return haveMotion_; }
+  // Motion-compensated temporal noise reduction of the converted frame; strength 0 turns it off.
+  void Temporal(float strength);
+  bool showMotion = false;  // debug overlay in Draw()
   // Copies `src` into `dst`, (re)creating dst with the same size and format (render target + shader resource).
   bool CopyToOwned(ID3D11Texture2D* src, RenderTarget& dst);
 
@@ -70,12 +79,21 @@ class Renderer {
   ID3D11Device* dev_ = nullptr;
   ID3D11DeviceContext* ctx_ = nullptr;
   ComPtr<ID3D11VertexShader> vs_;
-  ComPtr<ID3D11PixelShader> psConvert_, psMain_, psY_, psUV_;
+  ComPtr<ID3D11PixelShader> psConvert_, psMain_, psY_, psUV_, psDown_, psMotion_, psTemporal_, psCopy_;
   ComPtr<ID3D11Buffer> cb_;
   ComPtr<ID3D11SamplerState> samp_;
   ComPtr<ID3D11Texture2D> texY_, texUV_;
   ComPtr<ID3D11ShaderResourceView> srvY_, srvUV_;
   RenderTarget rgb_;
+
+  // Motion estimation / temporal state
+  RenderTarget pyrA_[4], pyrB_[4], mv_[4];
+  RenderTarget* cur_ = pyrA_;
+  RenderTarget* prev_ = pyrB_;
+  bool havePrevPyr_ = false, haveMotion_ = false;
+  RenderTarget hist_[2], rgbT_;
+  int histIdx_ = 0;
+  bool haveHist_ = false, temporalOut_ = false;
 
   RenderTarget nvY_, nvUV_;
   struct Slot {

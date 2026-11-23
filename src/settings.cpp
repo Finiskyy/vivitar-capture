@@ -28,6 +28,7 @@ void Settings::Load() {
   scaler = GetI(L"scaler", 2);
   sharpen = GetI(L"sharpen", 50);
   denoise = GetI(L"denoise", 30);
+  tnr = GetI(L"tnr", 40);
   bri = GetI(L"bri", 0) - 100;  // stored offset so negatives survive GetPrivateProfileInt
   con = GetI(L"con", 100);
   sat = GetI(L"sat", 100);
@@ -64,6 +65,7 @@ void Settings::Save() const {
   i(L"scaler", scaler);
   i(L"sharpen", sharpen);
   i(L"denoise", denoise);
+  i(L"tnr", tnr);
   i(L"bri", bri + 100);
   i(L"con", con);
   i(L"sat", sat);

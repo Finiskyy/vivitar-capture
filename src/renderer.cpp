@@ -9,6 +9,11 @@ static const char* kHLSL = R"HLSL(
 Texture2D<float>  TY   : register(t0);
 Texture2D<float2> TUV  : register(t1);
 Texture2D<float4> TRGB : register(t2);
+Texture2D<float2> TMV  : register(t3);   // full-res motion vectors (one per 8x8 block)
+Texture2D<float4> THist: register(t4);   // temporal history
+Texture2D<float>  TA   : register(t5);   // pyramid level, current frame
+Texture2D<float>  TB   : register(t6);   // pyramid level, previous frame
+Texture2D<float2> TMVc : register(t7);   // coarser level motion vectors
 SamplerState SL : register(s0);
 cbuffer CB : register(b0) { float4 A; float4 B; float4 C; float4 D; float4 E; };
 
@@ -104,9 +109,90 @@ float4 PSMain(V i) : SV_Target {
     float l = dot(col, float3(0.2126, 0.7152, 0.0722));
     o = float4(saturate(lerp(l.xxx, col, C.z)), 1);
   }
+  if (E.y > 0.5) {  // debug: colour by motion direction, brightness by speed
+    float2 mv = TMV.SampleLevel(SL, uv, 0);
+    float m = saturate(length(mv) / 12.0);
+    float a = atan2(mv.y, mv.x) / 6.2831853 + 0.5;
+    float3 hue = saturate(abs(frac(a + float3(0, 2.0 / 3, 1.0 / 3)) * 6 - 3) - 1);
+    o.rgb = lerp(o.rgb, hue, m * 0.75);
+  }
   if (C.w >= 0 && abs(i.pos.x - C.w) < D.x) o = 1;
   return o;
 }
+
+// ---- Motion estimation: hierarchical 8x8 block matching (backward vectors: prev(x + mv) ~= cur(x)).
+// Down: A.xy = source level size.
+float PSDown(V i) : SV_Target {
+  int2 p = int2(i.pos.xy) * 2; int2 mx = int2(A.xy) - 1;
+  return 0.25 * (TA.Load(int3(min(p, mx), 0)) + TA.Load(int3(min(p + int2(1, 0), mx), 0)) +
+                 TA.Load(int3(min(p + int2(0, 1), mx), 0)) + TA.Load(int3(min(p + int2(1, 1), mx), 0)));
+}
+// Motion: A = levelW, levelH, search radius, hasCoarse   B = coarseMvW, coarseMvH, halfPel
+float SADb(int2 o, float2 mv) {
+  float s = 0; int2 mx = int2(A.xy) - 1; float2 inv = 1.0 / A.xy;
+  [unroll] for (int y = 0; y < 8; y++) {
+    [unroll] for (int x = 0; x < 8; x++) {
+      int2 p = min(o + int2(x, y), mx);
+      s += abs(TA.Load(int3(p, 0)) - TB.SampleLevel(SL, (float2(p) + 0.5 + mv) * inv, 0));
+    }
+  }
+  return s;
+}
+static const int2 NB[5] = { int2(0, 0), int2(-1, 0), int2(1, 0), int2(0, -1), int2(0, 1) };
+static const float2 HP[8] = { float2(-.5, -.5), float2(0, -.5), float2(.5, -.5), float2(-.5, 0),
+                              float2(.5, 0), float2(-.5, .5), float2(0, .5), float2(.5, .5) };
+float2 PSMotion(V i) : SV_Target {
+  int2 bl = int2(i.pos.xy); int2 o = bl * 8;
+  float2 best = 0; float bestS = SADb(o, float2(0, 0)) * 0.97 - 0.02;  // ties go to "no motion" (noise)
+  if (A.w > 0.5) {
+    int2 cb = bl / 2; int2 cmx = int2(B.xy) - 1;
+    [unroll] for (int k = 0; k < 5; k++) {
+      float2 pr = TMVc.Load(int3(clamp(cb + NB[k], int2(0, 0), cmx), 0)) * 2;
+      float sc = SADb(o, pr);
+      if (sc < bestS) { bestS = sc; best = pr; }
+    }
+  }
+  int r = int(A.z); float2 c0 = best;
+  [loop] for (int dy = -r; dy <= r; dy++) {
+    [loop] for (int dx = -r; dx <= r; dx++) {
+      float2 pr = c0 + float2(dx, dy);
+      float sc = SADb(o, pr);
+      if (sc < bestS) { bestS = sc; best = pr; }
+    }
+  }
+  if (B.z > 0.5) {
+    float2 c1 = best;
+    [loop] for (int k2 = 0; k2 < 8; k2++) {
+      float2 pr = c1 + HP[k2];
+      float sc = SADb(o, pr);
+      if (sc < bestS) { bestS = sc; best = pr; }
+    }
+  }
+  return best;
+}
+// ---- Motion-compensated temporal noise reduction. A = W, H, strength, historyValid
+float4 PSTemporal(V i) : SV_Target {
+  int2 p = int2(i.pos.xy); int2 mx = int2(A.xy) - 1;
+  float3 c = TRGB.Load(int3(p, 0)).rgb;
+  if (A.w < 0.5) return float4(c, 1);
+  float2 mv = TMV.SampleLevel(SL, (float2(p) + 0.5) / A.xy, 0);
+  float2 hu = (float2(p) + 0.5 + mv) / A.xy;
+  if (any(hu < 0) || any(hu > 1)) return float4(c, 1);
+  float3 h = THist.SampleLevel(SL, hu, 0).rgb;
+  float3 mn = c, mxc = c;
+  [unroll] for (int y = -1; y <= 1; y++) {
+    [unroll] for (int x = -1; x <= 1; x++) {
+      float3 n = TRGB.Load(int3(clamp(p + int2(x, y), int2(0, 0), mx), 0)).rgb;
+      mn = min(mn, n); mxc = max(mxc, n);
+    }
+  }
+  float3 pad = 0.02 + (mxc - mn) * 0.15;           // allow noise-sized differences, not real changes
+  float3 hc = clamp(h, mn - pad, mxc + pad);
+  float3 d = h - c;
+  float w = A.z * exp(-dot(d, d) * 30.0);          // trust history less where it disagrees (bad match)
+  return float4(lerp(c, hc, w), 1);
+}
+float4 PSCopy(V i) : SV_Target { return float4(THist.Load(int3(int2(i.pos.xy), 0)).rgb, 1); }
 
 // ---- RGB -> NV12 (BT.709 limited range) for the encoder.
 float PSToY(V i) : SV_Target {
@@ -146,7 +232,8 @@ bool Renderer::Init(ID3D11Device* dev, ID3D11DeviceContext* ctx, std::string& er
   struct {
     const char* e;
     ComPtr<ID3D11PixelShader>* ps;
-  } list[] = {{"PSConvert", &psConvert_}, {"PSMain", &psMain_}, {"PSToY", &psY_}, {"PSToUV", &psUV_}};
+  } list[] = {{"PSConvert", &psConvert_}, {"PSMain", &psMain_}, {"PSToY", &psY_},         {"PSToUV", &psUV_},
+              {"PSDown", &psDown_},       {"PSMotion", &psMotion_}, {"PSTemporal", &psTemporal_}, {"PSCopy", &psCopy_}};
   for (auto& l : list) {
     if (FAILED(Compile(l.e, "ps_5_0", b, err))) return false;
     dev_->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, l.ps->GetAddressOf());
@@ -225,8 +312,8 @@ void Renderer::Pass(ID3D11RenderTargetView* rtv, float x, float y, float w, floa
     memcpy(m.pData, cb, cbSize);
     ctx_->Unmap(cb_.Get(), 0);
   }
-  ID3D11ShaderResourceView* nulls[3] = {};
-  ctx_->PSSetShaderResources(0, 3, nulls);
+  ID3D11ShaderResourceView* nulls[8] = {};
+  ctx_->PSSetShaderResources(0, 8, nulls);
   ctx_->OMSetRenderTargets(1, &rtv, nullptr);
   D3D11_VIEWPORT vp{x, y, w, h, 0, 1};
   ctx_->RSSetViewports(1, &vp);
@@ -236,12 +323,13 @@ void Renderer::Pass(ID3D11RenderTargetView* rtv, float x, float y, float w, floa
   ctx_->PSSetShader(ps, nullptr, 0);
   ctx_->PSSetConstantBuffers(0, 1, cb_.GetAddressOf());
   ctx_->PSSetSamplers(0, 1, samp_.GetAddressOf());
-  ID3D11ShaderResourceView* s[3] = {};
+  ID3D11ShaderResourceView* s[8] = {};
   int i = 0;
-  for (auto* v : srvs) s[i++] = v;
-  ctx_->PSSetShaderResources(0, 3, s);
+  for (auto* v : srvs)
+    if (i < 8) s[i++] = v;
+  ctx_->PSSetShaderResources(0, 8, s);
   ctx_->Draw(3, 0);
-  ctx_->PSSetShaderResources(0, 3, nulls);
+  ctx_->PSSetShaderResources(0, 8, nulls);
   ID3D11RenderTargetView* nrt = nullptr;
   ctx_->OMSetRenderTargets(1, &nrt, nullptr);
 }
@@ -340,7 +428,8 @@ void Renderer::Draw(RenderTarget& t, int fit, const EnhanceParams& e, const Colo
   if (!HasFrame() || !rgb_.srv) return;
   float x, y, w, h;
   FitRect(t.w, t.h, fit, x, y, w, h);
-  ID3D11ShaderResourceView* src = ov && ov->srv ? ov->srv : rgb_.srv.Get();
+  SrcOverride base = Rgb();
+  ID3D11ShaderResourceView* src = ov && ov->srv ? ov->srv : base.srv;
   float vw = ov && ov->srv ? float(ov->w) : float(srcW), vh = ov && ov->srv ? float(ov->h) : float(srcH);
   CBData cb{};
   cb.A[0] = x;
@@ -358,7 +447,80 @@ void Renderer::Draw(RenderTarget& t, int fit, const EnhanceParams& e, const Colo
   cb.D[0] = lineW;
   RangeParams(c, cb.D[1], cb.D[2], cb.D[3]);
   cb.E[0] = c.bt709 ? 1.f : 0.f;
-  Pass(t.rtv.Get(), x, y, w, h, psMain_.Get(), &cb, sizeof(cb), {srvY_.Get(), srvUV_.Get(), src});
+  bool mvOverlay = showMotion && haveMotion_ && mv_[0].srv;
+  cb.E[1] = mvOverlay ? 1.f : 0.f;
+  Pass(t.rtv.Get(), x, y, w, h, psMain_.Get(), &cb, sizeof(cb),
+       {srvY_.Get(), srvUV_.Get(), src, mvOverlay ? mv_[0].srv.Get() : nullptr});
+}
+
+void Renderer::Motion() {
+  if (!HasFrame() || !texY_) return;
+  std::swap(cur_, prev_);
+  UINT lw[4], lh[4];
+  bool sizeChanged = false;
+  for (int l = 0; l < 4; l++) {
+    lw[l] = std::max<UINT>(8, srcW >> l);
+    lh[l] = std::max<UINT>(8, srcH >> l);
+    Ensure(cur_[l], lw[l], lh[l], DXGI_FORMAT_R8_UNORM);
+    if (prev_[l].w != lw[l] || prev_[l].h != lh[l]) sizeChanged = true;
+  }
+  ctx_->CopyResource(cur_[0].tex.Get(), texY_.Get());
+  CBData cb{};
+  for (int l = 1; l < 4; l++) {
+    cb.A[0] = float(lw[l - 1]);
+    cb.A[1] = float(lh[l - 1]);
+    Pass(cur_[l].rtv.Get(), 0, 0, float(lw[l]), float(lh[l]), psDown_.Get(), &cb, sizeof(cb),
+         {nullptr, nullptr, nullptr, nullptr, nullptr, cur_[l - 1].srv.Get()});
+  }
+  if (sizeChanged || !havePrevPyr_) {
+    havePrevPyr_ = true;
+    haveMotion_ = false;
+    return;
+  }
+  for (int l = 3; l >= 0; l--) {
+    UINT mw = (lw[l] + 7) / 8, mh = (lh[l] + 7) / 8;
+    Ensure(mv_[l], mw, mh, DXGI_FORMAT_R16G16_FLOAT);
+    cb = {};
+    cb.A[0] = float(lw[l]);
+    cb.A[1] = float(lh[l]);
+    cb.A[2] = l == 3 ? 6.f : 1.f;  // wide search at the coarsest level, small refinements above it
+    cb.A[3] = l < 3 ? 1.f : 0.f;
+    if (l < 3) {
+      cb.B[0] = float(mv_[l + 1].w);
+      cb.B[1] = float(mv_[l + 1].h);
+    }
+    cb.B[2] = l == 0 ? 1.f : 0.f;  // half-pixel refinement at full resolution
+    Pass(mv_[l].rtv.Get(), 0, 0, float(mw), float(mh), psMotion_.Get(), &cb, sizeof(cb),
+         {nullptr, nullptr, nullptr, nullptr, nullptr, cur_[l].srv.Get(), prev_[l].srv.Get(),
+          l < 3 ? mv_[l + 1].srv.Get() : nullptr});
+  }
+  haveMotion_ = true;
+}
+
+void Renderer::Temporal(float strength) {
+  if (!HasFrame() || strength <= 0) {
+    temporalOut_ = false;
+    haveHist_ = false;
+    return;
+  }
+  bool re = Ensure(hist_[0], srcW, srcH, DXGI_FORMAT_R16G16B16A16_FLOAT);
+  re |= Ensure(hist_[1], srcW, srcH, DXGI_FORMAT_R16G16B16A16_FLOAT);
+  Ensure(rgbT_, srcW, srcH, DXGI_FORMAT_R8G8B8A8_UNORM);
+  if (re) haveHist_ = false;
+  RenderTarget& prevH = hist_[histIdx_];
+  RenderTarget& nextH = hist_[histIdx_ ^ 1];
+  CBData cb{};
+  cb.A[0] = float(srcW);
+  cb.A[1] = float(srcH);
+  cb.A[2] = strength;
+  cb.A[3] = (haveHist_ && haveMotion_) ? 1.f : 0.f;
+  Pass(nextH.rtv.Get(), 0, 0, float(srcW), float(srcH), psTemporal_.Get(), &cb, sizeof(cb),
+       {nullptr, nullptr, rgb_.srv.Get(), haveMotion_ ? mv_[0].srv.Get() : nullptr, prevH.srv.Get()});
+  Pass(rgbT_.rtv.Get(), 0, 0, float(srcW), float(srcH), psCopy_.Get(), &cb, sizeof(cb),
+       {nullptr, nullptr, nullptr, nullptr, nextH.srv.Get()});
+  histIdx_ ^= 1;
+  haveHist_ = true;
+  temporalOut_ = true;
 }
 
 void Renderer::ResetNV12() {

@@ -295,6 +295,14 @@ class App {
   void DrawUp(RenderTarget& t, int fit, const EnhanceParams& e, const ColorParams& c, float split, float lineW,
               const SrcOverride* ov, int slot, bool allowAmd);
   void DetectRefresh();
+  bool showMV = false;
+  // Motion estimation + temporal noise reduction for each new frame.
+  void PostProcess() {
+    bool tnr = S.enh && S.tnr > 0;
+    R.showMotion = showMV;
+    if (tnr || showMV) R.Motion();
+    R.Temporal(tnr ? S.tnr / 100.f * 0.85f : 0.f);
+  }
   int wantPW = 0, wantPH = 0;
   float splitFrac = 0.5f;
   bool compare = false;
@@ -471,12 +479,14 @@ void App::OutSize(UINT& w, UINT& h) const {
 }
 
 void App::ApplyPreset(int p) {
-  static const int P[4][3] = {{1, 40, 0}, {1, 30, 15}, {2, 50, 30}, {2, 80, 55}};
+  // scaler, sharpen, spatial denoise, temporal denoise
+  static const int P[4][4] = {{1, 40, 0, 0}, {1, 30, 10, 30}, {2, 50, 20, 45}, {2, 75, 35, 70}};
   S.preset = p;
   if (p < 4) {
     S.scaler = P[p][0];
     S.sharpen = P[p][1];
     S.denoise = P[p][2];
+    S.tnr = P[p][3];
   }
   Dirty();
 }
@@ -558,12 +568,16 @@ void App::Tick() {
         if (fg && S.dedupe && f.dup) continue;
         R.Upload(f);
         R.Convert(color, enh.denoise);
+        PostProcess();
         if (fg) ProcessFG(f.t, gpuRec);
         else RecordFrame(nullptr, f.t);
       }
       converted = true;
     } else {
       R.Upload(frames.back());
+      R.Convert(color, enh.denoise);
+      PostProcess();
+      converted = true;
     }
     cap->Recycle(frames);
   }
@@ -1408,6 +1422,10 @@ void App::Sidebar() {
   }
   if (LabeledSlider("##sh", "Sharpen", &S.sharpen, 0, 100, "%d")) S.preset = 4, Dirty();
   if (LabeledSlider("##dn", "Noise & block reduction", &S.denoise, 0, 100, "%d")) S.preset = 4, Dirty();
+  if (LabeledSlider("##tnr", "Temporal noise reduction", &S.tnr, 0, 100, "%d")) S.preset = 4, Dirty();
+  Muted("Tracks motion between frames and averages the grain away over time. Higher is cleaner but can smear "
+        "fast motion.");
+  Toggle("##showmv", "Show motion vectors (debug)", &showMV);
   if (LabeledSlider("##br", "Brightness", &S.bri, -50, 50, "%+d")) Dirty();
   if (LabeledSlider("##co", "Contrast", &S.con, 50, 150, "%d%%")) Dirty();
   if (LabeledSlider("##sa", "Saturation", &S.sat, 0, 200, "%d%%")) Dirty();

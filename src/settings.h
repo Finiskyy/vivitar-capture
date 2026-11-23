@@ -19,6 +19,7 @@ struct Settings {
   bool enh = false;
   int preset = 2;  // 0 fast, 1 subtle, 2 balanced, 3 strong, 4 custom
   int scaler = 2, sharpen = 50, denoise = 30, bri = 0, con = 100, sat = 100;
+  int tnr = 40;  // motion-compensated temporal noise reduction, 0..100
   bool enhRecord = true;
   int outRes = 0;  // 0 same as source, 1 1440p
 
