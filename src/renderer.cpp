@@ -145,7 +145,7 @@ float2 PSMotion(V i) : SV_Target {
   int2 bl = int2(i.pos.xy); int2 o = bl * 8;
   float2 best = 0; float bestS = SADb(o, float2(0, 0)) * 0.97 - 0.02;  // ties go to "no motion" (noise)
   if (A.w > 0.5) {
-    int2 cb = bl / 2; int2 cmx = int2(B.xy) - 1;
+    int2 cb = bl >> 1; int2 cmx = int2(B.xy) - 1;
     [unroll] for (int k = 0; k < 5; k++) {
       float2 pr = TMVc.Load(int3(clamp(cb + NB[k], int2(0, 0), cmx), 0)) * 2;
       float sc = SADb(o, pr);
