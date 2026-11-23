@@ -1,5 +1,8 @@
 #include "amd_fx.h"
 
+#include <algorithm>
+#include <deque>
+
 #include "components/FRC.h"
 #include "components/HQScaler.h"
 #include "components/VideoConverter.h"
@@ -29,6 +32,7 @@ struct AmdFx::Impl {
   // Encoder
   amf::AMFComponentPtr conv, enc;
   std::vector<EncodedPacket> pending;
+  std::deque<int64_t> ptsQ;  // our timestamps in submission order
 
   void TerminateAll() {
     held[0] = nullptr;
@@ -241,6 +245,7 @@ void AmdFx::EncStop() {
   p_->conv = nullptr;
   p_->enc = nullptr;
   p_->pending.clear();
+  p_->ptsQ.clear();
 }
 
 bool AmdFx::EncStart(UINT w, UINT h, UINT fpsN, UINT fpsD, UINT mbps, std::vector<uint8_t>& header, std::string& err) {
@@ -315,7 +320,8 @@ bool AmdFx::EncStart(UINT w, UINT h, UINT fpsN, UINT fpsD, UINT mbps, std::vecto
   return true;
 }
 
-static void CollectEncoded(amf::AMFComponent* enc, std::vector<EncodedPacket>& out, AMF_RESULT& last) {
+static void CollectEncoded(amf::AMFComponent* enc, std::deque<int64_t>& ptsQ, std::vector<EncodedPacket>& out,
+                           AMF_RESULT& last) {
   for (;;) {
     amf::AMFDataPtr d;
     last = enc->QueryOutput(&d);
@@ -325,7 +331,13 @@ static void CollectEncoded(amf::AMFComponent* enc, std::vector<EncodedPacket>& o
     EncodedPacket p;
     auto* bytes = (uint8_t*)b->GetNative();
     p.data.assign(bytes, bytes + b->GetSize());
-    p.pts = d->GetPts();
+    // Use our own timestamps rather than trusting the encoder to pass them through unchanged.
+    if (!ptsQ.empty()) {
+      p.pts = ptsQ.front();
+      ptsQ.pop_front();
+    } else {
+      p.pts = d->GetPts();
+    }
     amf_int64 type = -1;
     d->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &type);
     p.key = type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR || type == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_I;
@@ -351,10 +363,11 @@ bool AmdFx::EncSubmit(ID3D11Texture2D* rgba, int64_t pts, int64_t dur) {
     r = p_->enc->SubmitInput(nv12);
     if (r != AMF_INPUT_FULL) break;
     AMF_RESULT q;
-    CollectEncoded(p_->enc, p_->pending, q);
+    CollectEncoded(p_->enc, p_->ptsQ, p_->pending, q);
     Sleep(1);
   }
-  if (r != AMF_OK) Log("AMF encoder SubmitInput: %d", (int)r);
+  if (r == AMF_OK) p_->ptsQ.push_back(pts);
+  else Log("AMF encoder SubmitInput: %d", (int)r);
   return r == AMF_OK || r == AMF_INPUT_FULL;
 }
 
@@ -364,13 +377,13 @@ void AmdFx::EncPoll(std::vector<EncodedPacket>& out, bool drain) {
   p_->pending.clear();
   AMF_RESULT last = AMF_OK;
   if (!drain) {
-    CollectEncoded(p_->enc, out, last);
+    CollectEncoded(p_->enc, p_->ptsQ, out, last);
     return;
   }
   p_->enc->Drain();
   int64_t until = Now100ns() + 30000000;  // 3 s
   while (Now100ns() < until) {
-    CollectEncoded(p_->enc, out, last);
+    CollectEncoded(p_->enc, p_->ptsQ, out, last);
     if (last == AMF_EOF) break;
     Sleep(1);
   }

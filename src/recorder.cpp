@@ -295,6 +295,10 @@ void Recorder::Run(std::promise<std::string>* prom) {
   }
   // Pre-encoded video: the file is created when the first keyframe arrives (it carries SPS/PPS).
   std::deque<Item> early;
+  // Video frames are written one behind, so each frame's duration is the real time until the next frame.
+  // (A fixed 1/fps duration makes the video track drift away from the audio when frames arrive irregularly.)
+  bool havePend = false;
+  Item pend;
 
   const int64_t frameDur = int64_t(10000000.0 * cfg.fpsD / std::max<UINT32>(1, cfg.fpsN));
   int64_t lastVideo = -1;
@@ -338,16 +342,21 @@ void Recorder::Run(std::promise<std::string>* prom) {
       early.pop_front();
     }
     if (it.video) {
-      int64_t t = it.t;
-      if (t <= lastVideo) t = lastVideo + 1;
-      lastVideo = t;
-      hr = AddSample(w.Get(), vs, it.data, t, frameDur, cfg.preEncoded && it.key);
-      if (SUCCEEDED(hr)) {
-        if (firstV < 0) firstV = t;
-        nVideo++;
+      if (it.t <= lastVideo) it.t = lastVideo + 1;
+      lastVideo = it.t;
+      hr = S_OK;
+      if (havePend) {
+        int64_t dur = std::clamp<int64_t>(it.t - pend.t, 1, frameDur * 10);
+        hr = AddSample(w.Get(), vs, pend.data, pend.t, dur, cfg.preEncoded && pend.key);
+        if (SUCCEEDED(hr)) {
+          if (firstV < 0) firstV = pend.t;
+          nVideo++;
+        }
+        std::lock_guard<std::mutex> lk(m_);
+        if (pool_.size() < 4) pool_.push_back(std::move(pend.data));
       }
-      std::lock_guard<std::mutex> lk(m_);
-      if (pool_.size() < 4) pool_.push_back(std::move(it.data));
+      pend = std::move(it);
+      havePend = true;
     } else {
       hr = AddSample(w.Get(), as, it.data, it.t, int64_t(it.data.size() / 4) * 10000000LL / 48000, false);
       if (SUCCEEDED(hr)) {
@@ -361,6 +370,9 @@ void Recorder::Run(std::promise<std::string>* prom) {
       if (SUCCEEDED(firstErr)) firstErr = hr;
       nFail++;
     }
+  }
+  if (havePend && w) {
+    if (SUCCEEDED(AddSample(w.Get(), vs, pend.data, pend.t, frameDur, cfg.preEncoded && pend.key))) nVideo++;
   }
   Log("Recording stopping: %llu video frames (first at %.3fs, last at %.3fs), %llu audio chunks (%.3fs..%.3fs), %llu "
       "write failures, %u dropped",
