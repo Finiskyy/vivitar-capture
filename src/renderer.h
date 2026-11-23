@@ -28,6 +28,13 @@ struct ColorParams {
 
 enum Fit { FitContain = 0, FitCover = 1, FitStretch = 2, FitNative = 3 };
 
+// An alternative RGB source for Draw(): a frame-generation output or an AMD VideoSR upscale.
+struct SrcOverride {
+  ID3D11ShaderResourceView* srv = nullptr;
+  ID3D11Texture2D* tex = nullptr;
+  UINT w = 0, h = 0;
+};
+
 class Renderer {
  public:
   bool Init(ID3D11Device* dev, ID3D11DeviceContext* ctx, std::string& err);
@@ -38,7 +45,14 @@ class Renderer {
   // YUV -> RGB (+ noise reduction) into the internal source-resolution texture.
   void Convert(const ColorParams& c, float denoise);
   // Upscale/sharpen/colour into `t`. splitPx >= 0 shows the original left of that x position.
-  void Draw(RenderTarget& t, int fit, const EnhanceParams& e, const ColorParams& c, float splitPx, float lineW);
+  void Draw(RenderTarget& t, int fit, const EnhanceParams& e, const ColorParams& c, float splitPx, float lineW,
+            const SrcOverride* ov = nullptr);
+  // Where the picture lands inside a tw x th target for a fit mode (pixels).
+  void FitRect(UINT tw, UINT th, int fit, float& x, float& y, float& w, float& h) const;
+  // The converted source-resolution RGB frame.
+  SrcOverride Rgb() { return {rgb_.srv.Get(), rgb_.tex.Get(), rgb_.w, rgb_.h}; }
+  // Copies `src` into `dst`, (re)creating dst with the same size and format (render target + shader resource).
+  bool CopyToOwned(ID3D11Texture2D* src, RenderTarget& dst);
 
   bool Ensure(RenderTarget& t, UINT w, UINT h, DXGI_FORMAT fmt);
 

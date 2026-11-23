@@ -32,9 +32,11 @@ add_executable(VivitarCapture WIN32
   src/renderer.cpp
   src/settings.cpp
   src/util.cpp
+  src/amd_fx.cpp
   res/app.rc
   res/app.manifest)
 
+target_include_directories(VivitarCapture PRIVATE third_party/amf/include)
 target_compile_definitions(VivitarCapture PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 if(MSVC)
   target_compile_options(VivitarCapture PRIVATE /W3 /utf-8 /MP /permissive-)

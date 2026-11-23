@@ -1,4 +1,5 @@
 // Vivitar Capture — native Windows capture app (Media Foundation + Direct3D 11 + Dear ImGui).
+#include "amd_fx.h"
 #include "audio_out.h"
 #include "capture.h"
 #include "common.h"
@@ -6,6 +7,7 @@
 #include "renderer.h"
 #include "settings.h"
 
+#include <d3d10.h>
 #include <d3d11.h>
 #include <dwmapi.h>
 #include <dxgi1_6.h>
@@ -38,6 +40,7 @@ static ComPtr<ID3D11RenderTargetView> g_rtv;
 static HANDLE g_frameWait = nullptr;
 static UINT g_resizeW = 0, g_resizeH = 0;
 static std::string g_gpuName = "-";
+static UINT g_vendorId = 0;
 static const UINT kSwapFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
 static void CreateRTV() {
@@ -72,7 +75,11 @@ static bool CreateDeviceD3D(HWND hwnd) {
     DXGI_ADAPTER_DESC d;
     ad->GetDesc(&d);
     g_gpuName = W2U(d.Description);
+    g_vendorId = d.VendorId;
   }
+  // Media Foundation and AMD AMF may touch the device from their own threads.
+  ComPtr<ID3D10Multithread> mt;
+  if (SUCCEEDED(g_ctx.As(&mt))) mt->SetMultithreadProtected(TRUE);
   Log("GPU: %s", g_gpuName.c_str());
 
   DXGI_SWAP_CHAIN_DESC1 sd{};
@@ -258,6 +265,25 @@ class App {
   bool everOpened = false;
 
   RenderTarget preview, recRT, shotRT;
+
+  // AMD effects
+  AmdFx fx;
+  bool fgFailed = false, fgWas = false, recGpu = false;
+  struct FgFrame {
+    RenderTarget rt;
+    int64_t t = 0;
+  };
+  std::deque<FgFrame> fgQueue;
+  std::vector<RenderTarget> fgPool;
+  RenderTarget fgIn[4], upRT[2];
+  int fgInIdx = 0, displayHz = 60, fgOutCount = 0;
+  double fgFps = 0;
+  bool FgActive() const { return S.frameGen && fx.Ready() && !fgFailed && cap->IsOpen(); }
+  void ProcessFG(int64_t t, bool rec);
+  void RecordFrame(const SrcOverride* ov, int64_t t);
+  void DrawUp(RenderTarget& t, int fit, const EnhanceParams& e, const ColorParams& c, float split, float lineW,
+              const SrcOverride* ov, int slot, bool allowAmd);
+  void DetectRefresh();
   int wantPW = 0, wantPH = 0;
   float splitFrac = 0.5f;
   bool compare = false;
@@ -294,6 +320,8 @@ void App::Init() {
   if (!R.Init(g_dev.Get(), g_ctx.Get(), err)) ToastMsg(err, cRec, 10);
   UpdateMonitorVolume();
   mon.Start();
+  fx.Init(g_dev.Get(), g_vendorId);
+  DetectRefresh();
   Scan();
   OpenDevice();
 }
@@ -495,28 +523,36 @@ void App::Tick() {
   cap->TakeFrames(frames);
   ColorParams color = Color();
   EnhanceParams enh = Enh();
+  bool fg = FgActive();
+  if (fg != fgWas) {
+    for (auto& f : fgQueue) fgPool.push_back(std::move(f.rt));
+    fgQueue.clear();
+    fx.FrcReset();
+    fgWas = fg;
+  }
+  bool converted = false;
   if (!frames.empty()) {
     frameCount += (int)frames.size();
-    if (recording && recEnh) {
-      UINT rw, rh;
+    bool gpuRec = recording && recGpu;
+    if (fg || gpuRec) {
       for (auto& f : frames) {
         R.Upload(f);
         R.Convert(color, enh.denoise);
-        OutSize(rw, rh);
-        R.Ensure(recRT, rw, rh, DXGI_FORMAT_R8G8B8A8_UNORM);
-        R.Draw(recRT, FitContain, enh, color, -1.f, 1.f);
-        R.SubmitNV12(recRT, f.t);
-        R.CollectNV12([this](const uint8_t* d, size_t n, int64_t t) { rec.PushVideo(d, n, t); }, false);
+        if (fg) ProcessFG(f.t, gpuRec);
+        else RecordFrame(nullptr, f.t);
       }
+      converted = true;
     } else {
       R.Upload(frames.back());
     }
     cap->Recycle(frames);
   }
-  if (R.HasFrame()) R.Convert(color, enh.denoise);
+  if (R.HasFrame() && !converted) R.Convert(color, enh.denoise);
 
   if (now - fpsT >= 1.0) {
     measuredFps = frameCount / (now - fpsT);
+    fgFps = fgOutCount / (now - fpsT);
+    fgOutCount = 0;
     frameCount = 0;
     fpsT = now;
   }
@@ -548,7 +584,104 @@ void App::RenderPreview() {
   if (wantPW <= 0 || wantPH <= 0) return;
   R.Ensure(preview, wantPW, wantPH, DXGI_FORMAT_R8G8B8A8_UNORM);
   float split = (compare && S.enh) ? splitFrac * preview.w : -1.f;
-  R.Draw(preview, S.fit, Enh(), Color(), split, std::max(1.f, s));
+  // With frame generation, show the newest generated frame that is due.
+  SrcOverride fgSrc;
+  const SrcOverride* ov = nullptr;
+  if (FgActive() && !fgQueue.empty()) {
+    int64_t now = Now100ns();
+    while (fgQueue.size() > 1 && fgQueue[1].t <= now) {
+      fgPool.push_back(std::move(fgQueue.front().rt));
+      fgQueue.pop_front();
+    }
+    auto& f = fgQueue.front();
+    fgSrc = {f.rt.srv.Get(), f.rt.tex.Get(), f.rt.w, f.rt.h};
+    ov = &fgSrc;
+  }
+  DrawUp(preview, S.fit, Enh(), Color(), split, std::max(1.f, s), ov, 0, true);
+}
+
+void App::DrawUp(RenderTarget& t, int fit, const EnhanceParams& e, const ColorParams& c, float split, float lineW,
+                 const SrcOverride* ov, int slot, bool allowAmd) {
+  if (allowAmd && S.enh && S.upscaler > 0 && fx.Ready() && !fx.ScaleFailed() && R.HasFrame()) {
+    SrcOverride base = ov ? *ov : R.Rgb();
+    float x, y, w, h;
+    R.FitRect(t.w, t.h, fit, x, y, w, h);
+    // Only worth it when actually upscaling; AMD VideoSR takes the sharpen slider as its own sharpness.
+    if (base.tex && w > base.w * 1.02f && w <= 7680 && h <= 4320) {
+      ID3D11Texture2D* up = fx.Scale(slot, base.tex, base.w, base.h, (UINT)w, (UINT)h, S.upscaler == 2 ? 4 : 2,
+                                     e.sharpen * 2.f);
+      if (up && R.CopyToOwned(up, upRT[slot])) {
+        SrcOverride o{upRT[slot].srv.Get(), upRT[slot].tex.Get(), upRT[slot].w, upRT[slot].h};
+        EnhanceParams e2 = e;
+        e2.scaler = 0;
+        e2.sharpen = 0;
+        R.Draw(t, fit, e2, c, split, lineW, &o);
+        return;
+      }
+    }
+  }
+  R.Draw(t, fit, e, c, split, lineW, ov);
+}
+
+void App::ProcessFG(int64_t t, bool rec) {
+  std::string err;
+  if (!fx.FrcConfigure(R.srcW, R.srcH, err)) {
+    fgFailed = true;
+    ToastMsg("Frame generation is unavailable: " + err, cRec, 8);
+    return;
+  }
+  RenderTarget& in = fgIn[fgInIdx++ % 4];  // AMF keeps the previous frame, so rotate inputs
+  SrcOverride rgb = R.Rgb();
+  if (!R.CopyToOwned(rgb.tex, in)) return;
+  ID3D11Texture2D* outs[2] = {};
+  int n = fx.FrcProcess(in.tex.Get(), outs);
+  if (n < 0) {
+    fgFailed = true;
+    ToastMsg("AMD frame generation stopped working, so it was turned off.", cRec, 8);
+    return;
+  }
+  int64_t period = cap->cur.fpsN ? int64_t(10000000.0 * cap->cur.fpsD / cap->cur.fpsN) : 166667;
+  for (int i = 0; i < n; i++) {
+    FgFrame f;
+    if (!fgPool.empty()) {
+      f.rt = std::move(fgPool.back());
+      fgPool.pop_back();
+    }
+    if (!R.CopyToOwned(outs[i], f.rt)) continue;
+    // Interpolated frame shows at arrival time, the real frame half a frame later.
+    f.t = (n == 2 && i == 1) ? t + period / 2 : t;
+    fgOutCount++;
+    if (rec) {
+      SrcOverride o{f.rt.srv.Get(), f.rt.tex.Get(), f.rt.w, f.rt.h};
+      RecordFrame(&o, f.t);
+    }
+    fgQueue.push_back(std::move(f));
+  }
+  while (fgQueue.size() > 6) {
+    fgPool.push_back(std::move(fgQueue.front().rt));
+    fgQueue.pop_front();
+  }
+}
+
+void App::RecordFrame(const SrcOverride* ov, int64_t t) {
+  UINT rw = R.srcW, rh = R.srcH;
+  if (recEnh) OutSize(rw, rh);
+  R.Ensure(recRT, rw, rh, DXGI_FORMAT_R8G8B8A8_UNORM);
+  DrawUp(recRT, FitContain, recEnh ? Enh() : EnhanceParams{}, Color(), -1.f, 1.f, ov, 1, recEnh);
+  R.SubmitNV12(recRT, t);
+  R.CollectNV12([this](const uint8_t* d, size_t n, int64_t ts) { rec.PushVideo(d, n, ts); }, false);
+}
+
+void App::DetectRefresh() {
+  MONITORINFOEXW mi{};
+  mi.cbSize = sizeof(mi);
+  displayHz = 60;
+  if (GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+      displayHz = (int)dm.dmDisplayFrequency;
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -558,13 +691,15 @@ void App::StartRecording() {
   if (recording || !cap->IsOpen() || !R.HasFrame()) return;
   SHCreateDirectoryExW(nullptr, S.saveDir.c_str(), nullptr);
   recEnh = S.enh && S.enhRecord;
+  bool fg = FgActive();
+  recGpu = recEnh || fg;
   RecordConfig cfg;
   if (recEnh) OutSize(cfg.w, cfg.h);
   else {
     cfg.w = cap->outW;
     cfg.h = cap->outH;
   }
-  cfg.fpsN = cap->cur.fpsN ? cap->cur.fpsN : 60;
+  cfg.fpsN = (cap->cur.fpsN ? cap->cur.fpsN : 60) * (fg ? 2 : 1);
   cfg.fpsD = cap->cur.fpsD ? cap->cur.fpsD : 1;
   cfg.mbps = S.bitrate;
   cfg.audio = acap->IsOpen();
@@ -577,7 +712,7 @@ void App::StartRecording() {
   }
   recording = true;
   recBytes = 0;
-  if (recEnh) R.ResetNV12();
+  if (recGpu) R.ResetNV12();
   else cap->SetOnFrame([this](const VideoFrame& f) { rec.PushVideo(f.data.data(), f.data.size(), f.t); });
   ToastMsg("Recording started");
 }
@@ -585,7 +720,7 @@ void App::StartRecording() {
 void App::StopRecording() {
   if (!recording) return;
   cap->SetOnFrame(nullptr);
-  if (recEnh) R.CollectNV12([this](const uint8_t* d, size_t n, int64_t t) { rec.PushVideo(d, n, t); }, true);
+  if (recGpu) R.CollectNV12([this](const uint8_t* d, size_t n, int64_t t) { rec.PushVideo(d, n, t); }, true);
   recording = false;
   std::wstring path = rec.cfg.path;
   uint32_t dropped = rec.dropped.load();
@@ -601,7 +736,7 @@ void App::Screenshot() {
   UINT w = R.srcW, h = R.srcH;
   if (e) OutSize(w, h);
   R.Ensure(shotRT, w, h, DXGI_FORMAT_R8G8B8A8_UNORM);
-  R.Draw(shotRT, FitContain, e ? Enh() : EnhanceParams{}, Color(), -1.f, 1.f);
+  DrawUp(shotRT, FitContain, e ? Enh() : EnhanceParams{}, Color(), -1.f, 1.f, nullptr, 1, e);
   std::vector<uint8_t> px;
   if (!R.ReadRGBA(shotRT, px)) {
     ToastMsg("Screenshot failed", cRec);
@@ -829,6 +964,13 @@ void App::UI() {
       ToastMsg(S.enh ? "Enhancement on" : "Enhancement off");
     }
     if (ImGui::IsKeyPressed(ImGuiKey_C, false) && S.enh) compare = !compare;
+    if (ImGui::IsKeyPressed(ImGuiKey_G, false) && !recording && fx.Ready()) {
+      S.frameGen = !S.frameGen;
+      fgFailed = false;
+      DetectRefresh();
+      Dirty();
+      ToastMsg(S.frameGen ? "Frame generation on" : "Frame generation off");
+    }
   }
 }
 
@@ -873,7 +1015,8 @@ void App::TopBar(float h) {
   if (recording) st = "Recording", dot = cRec;
   else if (cap->IsOpen() && R.HasFrame()) {
     char b[64];
-    snprintf(b, sizeof(b), "Live  %ux%u  %.0f fps", R.srcW, R.srcH, measuredFps);
+    if (FgActive()) snprintf(b, sizeof(b), "Live  %ux%u  %.0f > %.0f fps", R.srcW, R.srcH, measuredFps, fgFps);
+    else snprintf(b, sizeof(b), "Live  %ux%u  %.0f fps", R.srcW, R.srcH, measuredFps);
     st = b;
     dot = cOk;
   } else st = "No signal";
@@ -940,7 +1083,8 @@ void App::Stage() {
   };
   if (live && !fullscreen) {
     char b2[64];
-    snprintf(b2, sizeof(b2), "%up%.0f  %ux%u%s", R.srcH, measuredFps, R.srcW, R.srcH, S.enh ? "  ENHANCED" : "");
+    snprintf(b2, sizeof(b2), "%up%.0f  %ux%u%s%s", R.srcH, FgActive() ? fgFps : measuredFps, R.srcW, R.srcH,
+             S.enh ? "  ENHANCED" : "", FgActive() ? "  FRAME GEN" : "");
     badge(ImVec2(b.x - 12 * s, a.y + 12 * s), b2, S.enh ? cAccent2 : 0xcfd3d8, true);
   }
   if (recording) {
@@ -1153,6 +1297,17 @@ void App::Sidebar() {
   if (Seg("preset", &p, {"Fast", "Subtle", "Balanced", "Strong", "Custom"})) ApplyPreset(p);
   ImGui::TextColored(V4(cMuted), "Upscaling");
   if (Seg("scaler", &S.scaler, {"Standard", "Bicubic", "Lanczos"})) S.preset = 4, Dirty();
+  ImGui::TextColored(V4(cMuted), "AMD upscaler");
+  {
+    const char* ups[] = {"Off (use the upscaler above)", "AMD VideoSR (FSR-based)", "AMD VideoSR 1.1 (experimental)"};
+    ImGui::BeginDisabled(!fx.Ready());
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::Combo("##amdup", &S.upscaler, ups, 3)) Dirty();
+    ImGui::EndDisabled();
+    if (!fx.Ready()) Muted(fx.status.c_str());
+    else if (S.upscaler > 0 && fx.ScaleFailed()) Muted("Your driver doesn't support AMD VideoSR, so the upscaler above is used.");
+    else if (S.upscaler > 0) Muted("Used when the picture is being enlarged. The Sharpen slider controls VideoSR's sharpness.");
+  }
   if (LabeledSlider("##sh", "Sharpen", &S.sharpen, 0, 100, "%d")) S.preset = 4, Dirty();
   if (LabeledSlider("##dn", "Noise & block reduction", &S.denoise, 0, 100, "%d")) S.preset = 4, Dirty();
   if (LabeledSlider("##br", "Brightness", &S.bri, -50, 50, "%+d")) Dirty();
@@ -1179,6 +1334,35 @@ void App::Sidebar() {
   if (ImGui::Combo("##out", &S.outRes, outs, 2)) Dirty();
   ImGui::EndDisabled();
   ImGui::EndDisabled();
+  Divider(s);
+
+  // ---- Frame generation
+  Section("FRAME GENERATION");
+  ImGui::BeginDisabled(lockRec || !fx.Ready());
+  bool fgv = S.frameGen;
+  if (Toggle("##fg", "AMD frame generation (2x)", &fgv)) {
+    S.frameGen = fgv;
+    fgFailed = false;
+    DetectRefresh();
+    Dirty();
+  }
+  ImGui::EndDisabled();
+  if (!fx.Ready()) Muted(fx.status.c_str());
+  else if (S.frameGen && fgFailed) Muted("Frame generation couldn't start. The log file has the details.");
+  else if (FgActive()) {
+    char fb[96];
+    snprintf(fb, sizeof(fb), "Running: %.0f fps in, %.0f fps out.", measuredFps, fgFps);
+    ImGui::TextColored(V4(cOk), "%s", fb);
+  }
+  Muted("Generates an in-between frame for every real one using AMD's video frame interpolation. Adds about half a "
+        "frame of delay, so it's best for watching and recording rather than playing off the preview.");
+  if (S.frameGen && fx.Ready() && displayHz < S.fps * 2) {
+    char hb[160];
+    snprintf(hb, sizeof(hb), "Your display runs at %d Hz, so the extra frames only show up in recordings.", displayHz);
+    ImGui::PushStyleColor(ImGuiCol_Text, V4(cWarn));
+    ImGui::TextWrapped("%s", hb);
+    ImGui::PopStyleColor();
+  }
   Divider(s);
 
   // ---- Audio
@@ -1234,11 +1418,14 @@ void App::Sidebar() {
   row("Audio", acap->IsOpen() ? acap->formatDesc : (audErr.empty() ? "None" : "Error"));
   row("GPU", g_gpuName);
   row("Encoder", rec.encoderName.empty() ? "H.264 / AAC (MP4)" : rec.encoderName);
+  row("AMD AMF", fx.Ready() ? fx.version : "Not available");
+  row("Display", std::to_string(displayHz) + " Hz");
   Divider(s);
 
   Section("SHORTCUTS");
   const char* keys[][2] = {{"Start / stop recording", "R"}, {"Screenshot", "S"},        {"Fullscreen preview", "F"},
-                           {"Mute monitor", "M"},           {"Enhance on / off", "E"}, {"Compare before / after", "C"}};
+                           {"Mute monitor", "M"},           {"Enhance on / off", "E"}, {"Compare before / after", "C"},
+                           {"Frame generation on / off", "G"}};
   for (auto& k : keys) row(k[0], k[1]);
   ImGui::Dummy(ImVec2(0, 10 * s));
 }
@@ -1346,7 +1533,8 @@ void App::BottomBar(float h) {
   ImGui::PopFont();
   std::string sub = "Ready";
   if (recording) {
-    sub = FmtSize(recBytes) + (recEnh ? "  Enhanced" : "") + "  " + std::to_string(rec.cfg.h) + "p";
+    sub = FmtSize(recBytes) + (recEnh ? "  Enhanced" : "") + "  " + std::to_string(rec.cfg.h) + "p" +
+          std::to_string((int)std::lround(double(rec.cfg.fpsN) / std::max<UINT32>(1, rec.cfg.fpsD)));
     if (rec.dropped) sub += "  " + std::to_string(rec.dropped.load()) + " dropped";
   }
   dl->AddText(ImVec2(tx, cy + 8 * s), Col(cDim), sub.c_str());

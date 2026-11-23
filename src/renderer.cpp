@@ -271,25 +271,77 @@ void Renderer::Convert(const ColorParams& c, float denoise) {
        {srvY_.Get(), srvUV_.Get(), nullptr});
 }
 
-void Renderer::Draw(RenderTarget& t, int fit, const EnhanceParams& e, const ColorParams& c, float splitPx, float lineW) {
+void Renderer::FitRect(UINT tw, UINT th, int fit, float& x, float& y, float& w, float& h) const {
+  float cw = float(tw), ch = float(th), vw = float(std::max<UINT>(1, srcW)), vh = float(std::max<UINT>(1, srcH));
+  x = 0, y = 0, w = cw, h = ch;
+  if (fit == FitStretch) return;
+  if (fit == FitNative) {
+    w = vw;
+    h = vh;
+  } else {
+    float s = fit == FitCover ? std::max(cw / vw, ch / vh) : std::min(cw / vw, ch / vh);
+    w = std::round(vw * s);
+    h = std::round(vh * s);
+  }
+  x = std::round((cw - w) / 2);
+  y = std::round((ch - h) / 2);
+}
+
+bool Renderer::CopyToOwned(ID3D11Texture2D* src, RenderTarget& dst) {
+  if (!src) return false;
+  D3D11_TEXTURE2D_DESC sd;
+  src->GetDesc(&sd);
+  if (!dst.tex || dst.w != sd.Width || dst.h != sd.Height || dst.fmt != sd.Format) {
+    dst = RenderTarget{};
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = sd.Width;
+    d.Height = sd.Height;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = sd.Format;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(dev_->CreateTexture2D(&d, nullptr, &dst.tex))) return false;
+    // Typeless textures (AMF sometimes allocates these) need an explicit view format.
+    DXGI_FORMAT vf = sd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM
+                     : sd.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS ? DXGI_FORMAT_B8G8R8A8_UNORM
+                                                                  : DXGI_FORMAT_UNKNOWN;
+    D3D11_RENDER_TARGET_VIEW_DESC rd{};
+    rd.Format = vf;
+    rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srd{};
+    srd.Format = vf;
+    srd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srd.Texture2D.MipLevels = 1;
+    dev_->CreateRenderTargetView(dst.tex.Get(), vf != DXGI_FORMAT_UNKNOWN ? &rd : nullptr, &dst.rtv);
+    dev_->CreateShaderResourceView(dst.tex.Get(), vf != DXGI_FORMAT_UNKNOWN ? &srd : nullptr, &dst.srv);
+    dst.w = sd.Width;
+    dst.h = sd.Height;
+    dst.fmt = sd.Format;
+  }
+  if (sd.ArraySize > 1 || sd.MipLevels > 1) {
+    // AMF pools frames in texture arrays and tags each texture with the slice in use.
+    static const GUID kAmfArrayIndex = {0x28115527, 0xe7c3, 0x4b66, {0x99, 0xd3, 0x4f, 0x2a, 0xe6, 0xb4, 0x7f, 0xaf}};
+    int slice = 0;
+    UINT sz = sizeof(slice);
+    if (FAILED(src->GetPrivateData(kAmfArrayIndex, &sz, &slice))) slice = 0;
+    ctx_->CopySubresourceRegion(dst.tex.Get(), 0, 0, 0, 0, src, D3D11CalcSubresource(0, slice, sd.MipLevels), nullptr);
+  } else
+    ctx_->CopyResource(dst.tex.Get(), src);
+  return true;
+}
+
+void Renderer::Draw(RenderTarget& t, int fit, const EnhanceParams& e, const ColorParams& c, float splitPx, float lineW,
+                    const SrcOverride* ov) {
   if (!t.rtv) return;
   float black[4] = {0, 0, 0, 1};
   ctx_->ClearRenderTargetView(t.rtv.Get(), black);
   if (!HasFrame() || !rgb_.srv) return;
-  float cw = float(t.w), ch = float(t.h), vw = float(srcW), vh = float(srcH);
-  float x = 0, y = 0, w = cw, h = ch;
-  if (fit != FitStretch) {
-    if (fit == FitNative) {
-      w = vw;
-      h = vh;
-    } else {
-      float s = fit == FitCover ? std::max(cw / vw, ch / vh) : std::min(cw / vw, ch / vh);
-      w = std::round(vw * s);
-      h = std::round(vh * s);
-    }
-    x = std::round((cw - w) / 2);
-    y = std::round((ch - h) / 2);
-  }
+  float x, y, w, h;
+  FitRect(t.w, t.h, fit, x, y, w, h);
+  ID3D11ShaderResourceView* src = ov && ov->srv ? ov->srv : rgb_.srv.Get();
+  float vw = ov && ov->srv ? float(ov->w) : float(srcW), vh = ov && ov->srv ? float(ov->h) : float(srcH);
   CBData cb{};
   cb.A[0] = x;
   cb.A[1] = y;
@@ -306,7 +358,7 @@ void Renderer::Draw(RenderTarget& t, int fit, const EnhanceParams& e, const Colo
   cb.D[0] = lineW;
   RangeParams(c, cb.D[1], cb.D[2], cb.D[3]);
   cb.E[0] = c.bt709 ? 1.f : 0.f;
-  Pass(t.rtv.Get(), x, y, w, h, psMain_.Get(), &cb, sizeof(cb), {srvY_.Get(), srvUV_.Get(), rgb_.srv.Get()});
+  Pass(t.rtv.Get(), x, y, w, h, psMain_.Get(), &cb, sizeof(cb), {srvY_.Get(), srvUV_.Get(), src});
 }
 
 void Renderer::ResetNV12() {
