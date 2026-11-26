@@ -525,12 +525,13 @@ bool Renderer::Deblock(float threshold) {
 void Renderer::Convert(const ColorParams& c, float denoise) {
   if (!HasFrame()) return;
   Ensure(rgb_, srcW, srcH, DXGI_FORMAT_R8G8B8A8_UNORM);
-  // The card's JPEG compression is the main artifact, so block/ringing removal does most of the work and the
-  // edge-preserving spatial filter only mops up what's left.
-  bool deblocked = denoise > 0 && Deblock(0.01f + 0.06f * denoise);
+  // The card's JPEG compression is the main artifact, so block/ringing removal does the work on its own. The old
+  // edge-preserving blur is skipped then: it flattens low-contrast texture (skin, grass) into a waxy look.
+  // The threshold stays low: coefficients the size of fine texture survive, only quantisation-sized ones go.
+  bool deblocked = denoise > 0 && Deblock(0.005f + 0.035f * denoise);
   CBData cb{};
   RangeParams(c, cb.A[0], cb.A[1], cb.A[2]);
-  cb.A[3] = deblocked ? denoise * 0.4f : denoise;
+  cb.A[3] = deblocked ? 0.f : denoise;
   cb.B[0] = c.bt709 ? 1.f : 0.f;
   cb.B[1] = float(srcW);
   cb.B[2] = float(srcH);
