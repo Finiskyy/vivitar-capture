@@ -500,7 +500,9 @@ bool Renderer::Deblock(float threshold) {
     ctx_->CSSetConstantBuffers(0, 1, cb_.GetAddressOf());
     ctx_->CSSetShaderResources(8, 1, &in);
     ctx_->CSSetUnorderedAccessViews(slot, 1, &out, nullptr);
-    ctx_->Dispatch(w / 8 + 1, h / 8 + 1, 16);  // +1: shifted grids start up to 6 pixels before the edge
+    // Shifted grids start up to 6 pixels before the edge, so one extra block row/column is needed to reach the
+    // far edge. (Rounding down here left the last rows of 540-row chroma unwritten: a green line at 1080p.)
+    ctx_->Dispatch((w + 7) / 8 + 1, (h + 7) / 8 + 1, 16);
     ID3D11ShaderResourceView* ns = nullptr;
     ID3D11UnorderedAccessView* nu = nullptr;
     ctx_->CSSetShaderResources(8, 1, &ns);
