@@ -1486,6 +1486,8 @@ void App::Sidebar() {
   }
   if (LabeledSlider("##sh", "Sharpen", &S.sharpen, 0, 100, "%d")) S.preset = 4, Dirty();
   if (LabeledSlider("##dn", "Noise & block reduction", &S.denoise, 0, 100, "%d")) S.preset = 4, Dirty();
+  if (S.denoise > 0 && R.DeblockOk())
+    Muted("Removes the blocks and edge ringing left by the card's built-in JPEG compression, before upscaling.");
   if (LabeledSlider("##tnr", "Temporal noise reduction", &S.tnr, 0, 100, "%d")) S.preset = 4, Dirty();
   Muted("Tracks motion between frames and averages the grain away over time. Higher is cleaner but can smear "
         "fast motion.");

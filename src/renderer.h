@@ -42,8 +42,9 @@ class Renderer {
   bool HasFrame() const { return srcW > 0; }
   UINT srcW = 0, srcH = 0;
 
-  // YUV -> RGB (+ noise reduction) into the internal source-resolution texture.
+  // YUV -> RGB (+ JPEG block/ringing removal and noise reduction) into the internal source-resolution texture.
   void Convert(const ColorParams& c, float denoise);
+  bool DeblockOk() const { return sppOk_; }
   // Upscale/sharpen/colour into `t`. splitPx >= 0 shows the original left of that x position.
   void Draw(RenderTarget& t, int fit, const EnhanceParams& e, const ColorParams& c, float splitPx, float lineW,
             const SrcOverride* ov = nullptr);
@@ -75,6 +76,9 @@ class Renderer {
   bool ReadRGBA(RenderTarget& src, std::vector<uint8_t>& out);
 
  private:
+  static constexpr int kSlots = 10;
+  // Shift-averaged DCT thresholding of the uploaded Y/UV planes (compute). Returns false if unavailable.
+  bool Deblock(float threshold);
   void Pass(ID3D11RenderTargetView* rtv, float x, float y, float w, float h, ID3D11PixelShader* ps, const void* cb,
             size_t cbSize, std::initializer_list<ID3D11ShaderResourceView*> srvs);
 
@@ -87,6 +91,17 @@ class Renderer {
   ComPtr<ID3D11Texture2D> texY_, texUV_;
   ComPtr<ID3D11ShaderResourceView> srvY_, srvUV_;
   RenderTarget rgb_;
+
+  // JPEG deblocking (see Deblock)
+  ComPtr<ID3D11ComputeShader> csSppY_, csSppUV_;
+  ComPtr<ID3D11PixelShader> psSppResolve_;
+  ComPtr<ID3D11Texture2D> sppArrY_, sppArrUV_;
+  ComPtr<ID3D11UnorderedAccessView> sppUavY_, sppUavUV_;
+  ComPtr<ID3D11ShaderResourceView> sppSrvY_, sppSrvUV_;
+  RenderTarget sppY_, sppUV_;
+  bool sppOk_ = true;
+  uint64_t uploadSerial_ = 0, sppSerial_ = 0;
+  float sppT_ = -1;
 
   // Motion estimation / temporal state
   RenderTarget pyrA_[4], pyrB_[4], mv_[4];
