@@ -41,6 +41,8 @@ float3 fetchRGB(int2 p) {
   float2 c = TUV.SampleLevel(SL, (float2(p) + 0.5) / B.yz, 0);
   return yuv2rgb(y, c, A.x, A.y, A.z, B.x);
 }
+static const float BAYER[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+// B.w > 0: the planes come from the deblocker (16-bit), so dither the 8-bit output to avoid banding.
 float4 PSConvert(V i) : SV_Target {
   int2 p = int2(i.pos.xy);
   float3 col = fetchRGB(p);
@@ -53,7 +55,70 @@ float4 PSConvert(V i) : SV_Target {
     }
     col = sum / ws;
   }
+  if (B.w > 0) col = saturate(col + (BAYER[(p.y & 3) * 4 + (p.x & 3)] / 16.0 - 0.46875) / 255.0);
   return float4(col, 1);
+}
+
+// ---- JPEG block/ringing removal (shift-averaged DCT thresholding, as in the classic "SPP" post-processor).
+// The card compresses every frame as JPEG, so the artifacts are 8x8 DCT blocks. For each of 16 grid shifts, every
+// 8x8 block is transformed, its small (quantisation-noise) coefficients are zeroed and it is transformed back;
+// averaging the 16 results removes block edges and ringing while keeping real detail.
+// A = plane W, H, threshold (x), threshold (y channel / chroma V)
+static const float DCT[64] = {
+  0.3535534, 0.3535534, 0.3535534, 0.3535534, 0.3535534, 0.3535534, 0.3535534, 0.3535534,
+  0.4903926, 0.4157348, 0.2777851, 0.0975452, -0.0975452, -0.2777851, -0.4157348, -0.4903926,
+  0.4619398, 0.1913417, -0.1913417, -0.4619398, -0.4619398, -0.1913417, 0.1913417, 0.4619398,
+  0.4157348, -0.0975452, -0.4903926, -0.2777851, 0.2777851, 0.4903926, 0.0975452, -0.4157348,
+  0.3535534, -0.3535534, -0.3535534, 0.3535534, 0.3535534, -0.3535534, -0.3535534, 0.3535534,
+  0.2777851, -0.4903926, 0.0975452, 0.4157348, -0.4157348, -0.0975452, 0.4903926, -0.2777851,
+  0.1913417, -0.4619398, 0.4619398, -0.1913417, -0.1913417, 0.4619398, -0.4619398, 0.1913417,
+  0.0975452, -0.2777851, 0.4157348, -0.4903926, 0.4903926, -0.4157348, 0.2777851, -0.0975452 };
+Texture2D<float2> TPlane : register(t8);
+RWTexture2DArray<float>  UOutY  : register(u0);
+RWTexture2DArray<float2> UOutUV : register(u1);
+groupshared float2 gB[64];
+groupshared float2 gT[64];
+float2 SppBlock(uint3 gid, uint3 tid, out int2 p) {
+  uint z = gid.z;
+  int2 origin = int2(gid.xy) * 8 - int2((z & 3) * 2, (z >> 2) * 2);
+  p = origin + int2(tid.xy);
+  int2 mx = int2(A.xy) - 1;
+  uint x = tid.x, y = tid.y;
+  gB[y * 8 + x] = TPlane.Load(int3(clamp(p, int2(0, 0), mx), 0));
+  GroupMemoryBarrierWithGroupSync();
+  float2 s = 0;  // forward, rows: gT[y][k=x]
+  [unroll] for (int n = 0; n < 8; n++) s += DCT[x * 8 + n] * gB[y * 8 + n];
+  gT[y * 8 + x] = s;
+  GroupMemoryBarrierWithGroupSync();
+  s = 0;  // forward, columns: coefficient (k=y, kx=x)
+  [unroll] for (int n2 = 0; n2 < 8; n2++) s += DCT[y * 8 + n2] * gT[n2 * 8 + x];
+  if (x + y > 0) s = abs(s) < A.zw ? 0 : s;  // keep DC, drop small AC coefficients
+  gB[y * 8 + x] = s;
+  GroupMemoryBarrierWithGroupSync();
+  s = 0;  // inverse, columns: gT[n=y][kx=x]
+  [unroll] for (int k = 0; k < 8; k++) s += DCT[k * 8 + y] * gB[k * 8 + x];
+  gT[y * 8 + x] = s;
+  GroupMemoryBarrierWithGroupSync();
+  s = 0;  // inverse, rows: pixel (y, n=x)
+  [unroll] for (int k2 = 0; k2 < 8; k2++) s += DCT[k2 * 8 + x] * gT[y * 8 + k2];
+  return s;
+}
+[numthreads(8, 8, 1)]
+void CSSppY(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+  int2 p; float2 v = SppBlock(gid, tid, p);
+  if (all(p >= 0) && all(p < int2(A.xy))) UOutY[uint3(p, gid.z)] = v.x;
+}
+[numthreads(8, 8, 1)]
+void CSSppUV(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+  int2 p; float2 v = SppBlock(gid, tid, p);
+  if (all(p >= 0) && all(p < int2(A.xy))) UOutUV[uint3(p, gid.z)] = v;
+}
+// Averages the 16 shifted reconstructions.
+Texture2DArray<float2> TSpp : register(t9);
+float2 PSSppResolve(V i) : SV_Target {
+  int2 p = int2(i.pos.xy); float2 s = 0;
+  [unroll] for (int z = 0; z < 16; z++) s += TSpp.Load(int4(p, z, 0));
+  return s / 16.0;
 }
 
 // ---- Pass 2: upscale + contrast-adaptive sharpening + colour + before/after split.
@@ -255,6 +320,21 @@ bool Renderer::Init(ID3D11Device* dev, ID3D11DeviceContext* ctx, std::string& er
     }
     dev_->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, l.ps->GetAddressOf());
   }
+  // JPEG deblocking: optional too (without it Convert falls back to the spatial filter alone).
+  {
+    std::string e2;
+    ComPtr<ID3DBlob> by, buv, br;
+    if (SUCCEEDED(Compile("CSSppY", "cs_5_0", by, e2)) && SUCCEEDED(Compile("CSSppUV", "cs_5_0", buv, e2)) &&
+        SUCCEEDED(Compile("PSSppResolve", "ps_5_0", br, e2)) &&
+        SUCCEEDED(dev_->CreateComputeShader(by->GetBufferPointer(), by->GetBufferSize(), nullptr, &csSppY_)) &&
+        SUCCEEDED(dev_->CreateComputeShader(buv->GetBufferPointer(), buv->GetBufferSize(), nullptr, &csSppUV_)) &&
+        SUCCEEDED(dev_->CreatePixelShader(br->GetBufferPointer(), br->GetBufferSize(), nullptr, &psSppResolve_)))
+      sppOk_ = true;
+    else {
+      sppOk_ = false;
+      Log("JPEG deblocking unavailable");
+    }
+  }
   D3D11_BUFFER_DESC bd{};
   bd.ByteWidth = sizeof(CBData);
   bd.Usage = D3D11_USAGE_DYNAMIC;
@@ -320,6 +400,7 @@ void Renderer::Upload(const VideoFrame& f) {
   }
   ctx_->UpdateSubresource(texY_.Get(), 0, nullptr, f.data.data(), f.w, 0);
   ctx_->UpdateSubresource(texUV_.Get(), 0, nullptr, f.data.data() + size_t(f.w) * f.h, f.w, 0);
+  uploadSerial_++;
 }
 
 void Renderer::Pass(ID3D11RenderTargetView* rtv, float x, float y, float w, float h, ID3D11PixelShader* ps,
@@ -329,8 +410,8 @@ void Renderer::Pass(ID3D11RenderTargetView* rtv, float x, float y, float w, floa
     memcpy(m.pData, cb, cbSize);
     ctx_->Unmap(cb_.Get(), 0);
   }
-  ID3D11ShaderResourceView* nulls[8] = {};
-  ctx_->PSSetShaderResources(0, 8, nulls);
+  ID3D11ShaderResourceView* nulls[kSlots] = {};
+  ctx_->PSSetShaderResources(0, kSlots, nulls);
   ctx_->OMSetRenderTargets(1, &rtv, nullptr);
   D3D11_VIEWPORT vp{x, y, w, h, 0, 1};
   ctx_->RSSetViewports(1, &vp);
@@ -340,13 +421,13 @@ void Renderer::Pass(ID3D11RenderTargetView* rtv, float x, float y, float w, floa
   ctx_->PSSetShader(ps, nullptr, 0);
   ctx_->PSSetConstantBuffers(0, 1, cb_.GetAddressOf());
   ctx_->PSSetSamplers(0, 1, samp_.GetAddressOf());
-  ID3D11ShaderResourceView* s[8] = {};
+  ID3D11ShaderResourceView* s[kSlots] = {};
   int i = 0;
   for (auto* v : srvs)
-    if (i < 8) s[i++] = v;
-  ctx_->PSSetShaderResources(0, 8, s);
+    if (i < kSlots) s[i++] = v;
+  ctx_->PSSetShaderResources(0, kSlots, s);
   ctx_->Draw(3, 0);
-  ctx_->PSSetShaderResources(0, 8, nulls);
+  ctx_->PSSetShaderResources(0, kSlots, nulls);
   ID3D11RenderTargetView* nrt = nullptr;
   ctx_->OMSetRenderTargets(1, &nrt, nullptr);
 }
@@ -363,17 +444,100 @@ static void RangeParams(const ColorParams& c, float& yOff, float& yScale, float&
   }
 }
 
+// Creates a 16-slice array (one slice per grid shift) with UAV + SRV, for the deblocker.
+static bool MakeSppArray(ID3D11Device* dev, UINT w, UINT h, DXGI_FORMAT fmt, ComPtr<ID3D11Texture2D>& tex,
+                         ComPtr<ID3D11UnorderedAccessView>& uav, ComPtr<ID3D11ShaderResourceView>& srv) {
+  D3D11_TEXTURE2D_DESC d{};
+  if (tex) {
+    tex->GetDesc(&d);
+    if (d.Width == w && d.Height == h) return true;
+  }
+  tex.Reset();
+  uav.Reset();
+  srv.Reset();
+  d = {};
+  d.Width = w;
+  d.Height = h;
+  d.MipLevels = 1;
+  d.ArraySize = 16;
+  d.Format = fmt;
+  d.SampleDesc.Count = 1;
+  d.Usage = D3D11_USAGE_DEFAULT;
+  d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+  return SUCCEEDED(dev->CreateTexture2D(&d, nullptr, &tex)) &&
+         SUCCEEDED(dev->CreateUnorderedAccessView(tex.Get(), nullptr, &uav)) &&
+         SUCCEEDED(dev->CreateShaderResourceView(tex.Get(), nullptr, &srv));
+}
+
+bool Renderer::Deblock(float threshold) {
+  if (!sppOk_ || srcW < 16 || srcH < 16) return false;
+  UINT cw = srcW / 2, ch = srcH / 2;
+  if (!MakeSppArray(dev_, srcW, srcH, DXGI_FORMAT_R16_FLOAT, sppArrY_, sppUavY_, sppSrvY_) ||
+      !MakeSppArray(dev_, cw, ch, DXGI_FORMAT_R16G16_FLOAT, sppArrUV_, sppUavUV_, sppSrvUV_)) {
+    Log("JPEG deblocking: couldn't allocate its textures");
+    sppOk_ = false;
+    return false;
+  }
+  bool fresh = Ensure(sppY_, srcW, srcH, DXGI_FORMAT_R16_FLOAT);
+  fresh |= Ensure(sppUV_, cw, ch, DXGI_FORMAT_R16G16_FLOAT);
+  if (!fresh && sppSerial_ == uploadSerial_ && sppT_ == threshold) return true;  // this picture is done already
+  sppSerial_ = uploadSerial_;
+  sppT_ = threshold;
+
+  auto run = [&](ID3D11ComputeShader* cs, ID3D11ShaderResourceView* in, ID3D11UnorderedAccessView* out, UINT slot,
+                 UINT w, UINT h, float tx, float ty) {
+    CBData cb{};
+    cb.A[0] = float(w);
+    cb.A[1] = float(h);
+    cb.A[2] = tx;
+    cb.A[3] = ty;
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(ctx_->Map(cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+      memcpy(m.pData, &cb, sizeof(cb));
+      ctx_->Unmap(cb_.Get(), 0);
+    }
+    ctx_->CSSetShader(cs, nullptr, 0);
+    ctx_->CSSetConstantBuffers(0, 1, cb_.GetAddressOf());
+    ctx_->CSSetShaderResources(8, 1, &in);
+    ctx_->CSSetUnorderedAccessViews(slot, 1, &out, nullptr);
+    // Shifted grids start up to 6 pixels before the edge, so one extra block row/column is needed to reach the
+    // far edge. (Rounding down here left the last rows of 540-row chroma unwritten: a green line at 1080p.)
+    ctx_->Dispatch((w + 7) / 8 + 1, (h + 7) / 8 + 1, 16);
+    ID3D11ShaderResourceView* ns = nullptr;
+    ID3D11UnorderedAccessView* nu = nullptr;
+    ctx_->CSSetShaderResources(8, 1, &ns);
+    ctx_->CSSetUnorderedAccessViews(slot, 1, &nu, nullptr);
+    ctx_->CSSetShader(nullptr, nullptr, 0);
+  };
+  // Chroma carries coarser, stronger artifacts and little fine detail, so it gets a higher threshold.
+  run(csSppY_.Get(), srvY_.Get(), sppUavY_.Get(), 0, srcW, srcH, threshold, threshold);
+  run(csSppUV_.Get(), srvUV_.Get(), sppUavUV_.Get(), 1, cw, ch, threshold * 1.5f, threshold * 1.5f);
+
+  CBData cb{};
+  ID3D11ShaderResourceView* none = nullptr;
+  Pass(sppY_.rtv.Get(), 0, 0, float(srcW), float(srcH), psSppResolve_.Get(), &cb, sizeof(cb),
+       {none, none, none, none, none, none, none, none, none, sppSrvY_.Get()});
+  Pass(sppUV_.rtv.Get(), 0, 0, float(cw), float(ch), psSppResolve_.Get(), &cb, sizeof(cb),
+       {none, none, none, none, none, none, none, none, none, sppSrvUV_.Get()});
+  return true;
+}
+
 void Renderer::Convert(const ColorParams& c, float denoise) {
   if (!HasFrame()) return;
   Ensure(rgb_, srcW, srcH, DXGI_FORMAT_R8G8B8A8_UNORM);
+  // The card's JPEG compression is the main artifact, so block/ringing removal does the work on its own. The old
+  // edge-preserving blur is skipped then: it flattens low-contrast texture (skin, grass) into a waxy look.
+  // The threshold stays low: coefficients the size of fine texture survive, only quantisation-sized ones go.
+  bool deblocked = denoise > 0 && Deblock(0.005f + 0.035f * denoise);
   CBData cb{};
   RangeParams(c, cb.A[0], cb.A[1], cb.A[2]);
-  cb.A[3] = denoise;
+  cb.A[3] = deblocked ? 0.f : denoise;
   cb.B[0] = c.bt709 ? 1.f : 0.f;
   cb.B[1] = float(srcW);
   cb.B[2] = float(srcH);
+  cb.B[3] = deblocked ? 1.f : 0.f;
   Pass(rgb_.rtv.Get(), 0, 0, float(srcW), float(srcH), psConvert_.Get(), &cb, sizeof(cb),
-       {srvY_.Get(), srvUV_.Get(), nullptr});
+       {deblocked ? sppY_.srv.Get() : srvY_.Get(), deblocked ? sppUV_.srv.Get() : srvUV_.Get(), nullptr});
 }
 
 void Renderer::FitRect(UINT tw, UINT th, int fit, float& x, float& y, float& w, float& h) const {

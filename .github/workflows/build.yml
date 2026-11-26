@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -28,7 +29,8 @@ jobs:
           $m = [regex]::Match($src, 'R"HLSL\((.*?)\)HLSL"', 'Singleline')
           Set-Content -Path shaders.hlsl -Value $m.Groups[1].Value
           $entries = @(@('VSMain','vs_5_0'),@('PSConvert','ps_5_0'),@('PSMain','ps_5_0'),@('PSToY','ps_5_0'),@('PSToUV','ps_5_0'),
-                       @('PSDown','ps_5_0'),@('PSMotion','ps_5_0'),@('PSTemporal','ps_5_0'),@('PSCopy','ps_5_0'),@('PSMVUp','ps_5_0'))
+                       @('PSDown','ps_5_0'),@('PSMotion','ps_5_0'),@('PSTemporal','ps_5_0'),@('PSCopy','ps_5_0'),@('PSMVUp','ps_5_0'),
+                       @('CSSppY','cs_5_0'),@('CSSppUV','cs_5_0'),@('PSSppResolve','ps_5_0'))
           $failed = $false
           foreach ($e in $entries) {
             & $fxc.FullName /nologo /O3 /E $e[0] /T $e[1] /Fo NUL shaders.hlsl
@@ -74,6 +76,7 @@ jobs:
           path: dist/*
 
       - name: Publish "latest" release
+        if: github.event_name != 'pull_request'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

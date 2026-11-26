@@ -225,6 +225,7 @@ class App {
   EnhanceParams Enh() const;
   void OutSize(UINT& w, UINT& h) const;
   void ApplyPreset(int p);
+  int BestUpscaler() const;  // 1 AMD VideoSR, else 0 (shader upscaler)
   void Dirty() {
     settingsDirty = true;
     lastChange = NowSecs();
@@ -491,15 +492,36 @@ void App::OutSize(UINT& w, UINT& h) const {
   }
 }
 
+int App::BestUpscaler() const {
+  // AMD VideoSR is built for video. FSR is a game upscaler: with no camera jitter and only block-matched motion
+  // vectors it behaves like TAA and smooths fine texture away, so Premium doesn't pick it (it stays selectable).
+  if (fx.Ready() && !fx.ScaleFailed()) return 1;
+  return 0;  // Lanczos + sharpening
+}
+
 void App::ApplyPreset(int p) {
-  // scaler, sharpen, spatial denoise, temporal denoise
-  static const int P[4][4] = {{1, 40, 0, 0}, {1, 30, 10, 30}, {2, 50, 20, 45}, {2, 75, 35, 70}};
+  // scaler, sharpen, spatial denoise, temporal denoise (index 4 is Custom)
+  static const int P[6][4] = {{1, 40, 0, 0},  {1, 30, 10, 30}, {2, 50, 20, 45},
+                              {2, 75, 35, 70}, {0, 0, 0, 0},    {2, 30, 45, 40}};
   S.preset = p;
-  if (p < 4) {
+  if (p != 4) {
     S.scaler = P[p][0];
     S.sharpen = P[p][1];
     S.denoise = P[p][2];
     S.tnr = P[p][3];
+  }
+  if (p == 5) {
+    // Premium: 1440p through the best upscaler this PC has, with the JPEG clean-up doing the heavy lifting and
+    // gentle sharpening (strong sharpening brings compression artifacts back as halos).
+    if (!recording) {  // output size and enhancement are locked while recording
+      S.enh = true;
+      S.outRes = 1;
+    }
+    int up = BestUpscaler();
+    if (up != S.upscaler) {
+      S.upscaler = up;
+      fsrLast[0] = fsrLast[1] = FsrLast{};
+    }
   }
   Dirty();
 }
@@ -1452,7 +1474,18 @@ void App::Sidebar() {
   ImGui::BeginDisabled(!S.enh);
   ImGui::Dummy(ImVec2(0, 4 * s));
   ImGui::TextColored(V4(cMuted), "Preset");
-  int p = S.preset;
+  {
+    // One-click best quality. A separate button (not a sixth segment) so the preset labels still fit.
+    bool prem = S.preset == 5;
+    ImGui::PushStyleColor(ImGuiCol_Border, prem ? V4(cAccent) : V4(cLine2));
+    ImGui::PushStyleColor(ImGuiCol_Text, prem ? V4(cText) : V4(cMuted));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1);
+    if (ImGui::Button(prem ? "Premium 1440p (on)" : "Premium 1440p", ImVec2(-1, 30 * s))) ApplyPreset(5);
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+    if (prem) Muted("Compression clean-up, then AMD VideoSR (or Lanczos) to 1440p.");
+  }
+  int p = S.preset == 5 ? -1 : S.preset;  // Premium is shown by the button above
   if (Seg("preset", &p, {"Fast", "Subtle", "Balanced", "Strong", "Custom"})) ApplyPreset(p);
   ImGui::TextColored(V4(cMuted), "Upscaling");
   if (Seg("scaler", &S.scaler, {"Standard", "Bicubic", "Lanczos"})) S.preset = 4, Dirty();
@@ -1465,6 +1498,7 @@ void App::Sidebar() {
     ImGui::SetNextItemWidth(-1);
     if (ImGui::Combo("##amdup", &S.upscaler, ups, 5)) {
       fsrLast[0] = fsrLast[1] = FsrLast{};
+      if (S.preset == 5) S.preset = 4;
       Dirty();
     }
     if (S.upscaler == 1 || S.upscaler == 2) {
@@ -1486,6 +1520,8 @@ void App::Sidebar() {
   }
   if (LabeledSlider("##sh", "Sharpen", &S.sharpen, 0, 100, "%d")) S.preset = 4, Dirty();
   if (LabeledSlider("##dn", "Noise & block reduction", &S.denoise, 0, 100, "%d")) S.preset = 4, Dirty();
+  if (S.denoise > 0 && R.DeblockOk())
+    Muted("Removes the blocks and edge ringing left by the card's built-in JPEG compression, before upscaling.");
   if (LabeledSlider("##tnr", "Temporal noise reduction", &S.tnr, 0, 100, "%d")) S.preset = 4, Dirty();
   Muted("Tracks motion between frames and averages the grain away over time. Higher is cleaner but can smear "
         "fast motion.");
@@ -1511,7 +1547,10 @@ void App::Sidebar() {
   ImGui::TextColored(V4(cMuted), "Output resolution");
   const char* outs[] = {"Same as source", "1440p (upscaled)"};
   ImGui::SetNextItemWidth(-1);
-  if (ImGui::Combo("##out", &S.outRes, outs, 2)) Dirty();
+  if (ImGui::Combo("##out", &S.outRes, outs, 2)) {
+    if (S.preset == 5) S.preset = 4;
+    Dirty();
+  }
   ImGui::EndDisabled();
   ImGui::EndDisabled();
   Divider(s);
