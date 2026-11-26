@@ -225,7 +225,7 @@ class App {
   EnhanceParams Enh() const;
   void OutSize(UINT& w, UINT& h) const;
   void ApplyPreset(int p);
-  int BestUpscaler() const;  // 4 FSR 4, 3 FSR 3, 1 AMD VideoSR, 0 shader upscaler
+  int BestUpscaler() const;  // 1 AMD VideoSR, else 0 (shader upscaler)
   void Dirty() {
     settingsDirty = true;
     lastChange = NowSecs();
@@ -493,10 +493,10 @@ void App::OutSize(UINT& w, UINT& h) const {
 }
 
 int App::BestUpscaler() const {
-  if (fsr.Ready() && fsr.HasMajor(4) && !fsr.Failed(4)) return 4;
-  if (fsr.Ready() && fsr.HasMajor(3) && !fsr.Failed(3)) return 3;
+  // AMD VideoSR is built for video. FSR is a game upscaler: with no camera jitter and only block-matched motion
+  // vectors it behaves like TAA and smooths fine texture away, so Premium doesn't pick it (it stays selectable).
   if (fx.Ready() && !fx.ScaleFailed()) return 1;
-  return 0;
+  return 0;  // Lanczos + sharpening
 }
 
 void App::ApplyPreset(int p) {
@@ -1483,7 +1483,7 @@ void App::Sidebar() {
     if (ImGui::Button(prem ? "Premium 1440p (on)" : "Premium 1440p", ImVec2(-1, 30 * s))) ApplyPreset(5);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(2);
-    if (prem) Muted("Compression clean-up, then the best upscaler this PC has, to 1440p.");
+    if (prem) Muted("Compression clean-up, then AMD VideoSR (or Lanczos) to 1440p.");
   }
   int p = S.preset == 5 ? -1 : S.preset;  // Premium is shown by the button above
   if (Seg("preset", &p, {"Fast", "Subtle", "Balanced", "Strong", "Custom"})) ApplyPreset(p);
